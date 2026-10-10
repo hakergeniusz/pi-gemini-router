@@ -1,0 +1,30 @@
+{
+	"name": "pi-gemini-router",
+	"version": "0.1.0",
+	"description": "Adds gemini-flash and gemini-flash-lite router models that fall back across flash generations and API keys until one answers.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi",
+		"pi-package",
+		"gemini",
+		"router",
+		"virtual-model",
+		"extensions"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^26.6.4",
+		"typescript": "^5.9.3"
+	}
+}

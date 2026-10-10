@@ -1,0 +1,20 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"types": ["node"],
+		"lib": ["ES2022"],
+		"baseUrl": ".",
+		"paths": {
+			"@earendil-works/pi-coding-agent": [
+				"/home/hakergeniusz/.local/share/npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+			]
+		}
+	},
+	"include": ["index.ts"]
+}
