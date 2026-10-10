@@ -22,29 +22,34 @@ google/gemini-flash-lite   gemini-flash-lite-latest → 3.5-flash-lite → 3.1-f
 - `-latest` aliases head the ladder and share the concrete model's quota bucket,
   which is why they are tried first rather than counted as extra capacity.
 
-## The interactive-mode signal fix
+## The abort-signal and URL fixes
 
-Interactive mode passes a duck-typed abort signal into turn options: truthy,
-with `.aborted`, but no `addEventListener`. pi-ai's Google adapter forwards
-`options.signal` into genai's `config.abortSignal`, where the SDK's
-`createAttemptSignal(timeout, callerSignal)` calls
-`callerSignal.addEventListener(...)`. Every Google model then fails with
+Interactive (TTY) turns die with `Error: callerSignal.addEventListener is not
+a function` — and once that is fixed, every request still 404s. Three stacked
+problems, all patched here by re-registering `google` and every `google-keyN`
+provider with a guarded `streamSimple`:
 
-```
-Error: callerSignal.addEventListener is not a function
-```
+1. **Duck-typed turn signals.** TTY turn options carry a truthy abort signal
+   with `.aborted` but no `addEventListener`; the genai client calls
+   `callerSignal.addEventListener(...)` and dies. Dropped (kept as a real
+   `AbortSignal.abort()` when already aborted) in `signal.ts`.
+2. **Payload clones strip the signal.** `before_provider_request` handlers
+   rebuild the request — pi-output-cap, for one, runs it through
+   `structuredClone`, and Node's structuredClone degrades an AbortSignal to a
+   plain `{}` (verified on node 26). The adapter's `onPayload` hook is wrapped
+   so the original signal is restored after any transform.
+3. **Unversioned request URLs.** pi-ai's `createClient` sets `apiVersion: ""`
+   whenever `model.baseUrl` is set ("baseUrl already includes version path"),
+   but the catalog's Google baseUrl is the bare host — the SDK then builds
+   `…googleapis.com/models/…` without `/v1beta` and Google answers 404 for
+   every request. The adapter now receives a model whose baseUrl carries the
+   version.
 
-Headless runs pass real AbortSignals, so only the TUI hits this. The extension
-re-registers `google` and every `google-keyN` provider with a `streamSimple`
-wrapper that drops duck-typed signals (keeping already-aborted ones as a real
-`AbortSignal.abort()`); real signals pass through untouched.
-
-The wrapper reaches the Google adapter through `@earendil-works/pi-ai/compat`
-(`googleGenerativeAIApi().streamSimple`). Extension imports resolve against a
-fixed module table in compiled pi builds, and the eager
-`@earendil-works/pi-ai/api/google-generative-ai` specifier is not in it —
-importing it there fails the whole extension at load time, which is why an
-earlier revision of this fix never took effect.
+The wrapper reaches the adapter through `@earendil-works/pi-ai/compat`
+(`googleGenerativeAIApi()`); the eager
+`@earendil-works/pi-ai/api/google-generative-ai` specifier is not in pi's
+extension module table (VIRTUAL_MODULES / aliases), so importing it fails the
+whole extension at load time in compiled builds.
 
 Rationale: AI Studio free-tier quotas are per model *and* per project — Flash
 models get 20 RPD each, Flash Lite 500 RPD each — so 7 projects × 6 flash

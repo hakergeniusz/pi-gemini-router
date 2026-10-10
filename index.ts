@@ -23,11 +23,14 @@
  * `/gemini-router` shows the ladders and discovered keys; `/gemini-router reset`
  * bumps an epoch so the next request starts at gemini-flash-latest on key1
  * (useful after the daily quota resets).
+ *
+ * The provider patch below also keeps the Google adapter alive across two
+ * abort-signal hazards (see restoreAbortSignal and sanitizeSignal).
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
-import { googleGenerativeAIApi } from "@earendil-works/pi-ai/compat";
+import { googleGenerativeAIApi, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { sanitizeSignal } from "./signal.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -70,8 +73,8 @@ let epoch = 0;
 
 const GOOGLE_API = "google-generative-ai" as const;
 
-/**
- * The Google adapter's streamSimple, reached through the compat entrypoint.
+/** The Google adapter, reached through the compat entrypoint.
+ *
  * Extension imports resolve against a fixed module table (VIRTUAL_MODULES in
  * compiled pi builds, aliases otherwise) that maps only the pi-ai root and a
  * few subpaths — the eager `@earendil-works/pi-ai/api/google-generative-ai`
@@ -79,14 +82,89 @@ const GOOGLE_API = "google-generative-ai" as const;
  * load time. The compat entrypoint is mapped everywhere and lazily loads the
  * same adapter module on first stream call.
  */
-const googleStreamSimple = googleGenerativeAIApi().streamSimple;
+const googleStreams = googleGenerativeAIApi();
+
+/** True only for real AbortSignals; false for `{}` clones and duck types. */
+function isRealAbortSignal(value: unknown): value is AbortSignal {
+  return !!value && typeof (value as AbortSignal).addEventListener === "function";
+}
+
+/**
+ * Give the SDK a versioned baseUrl.
+ *
+ * pi-ai's createClient sets `apiVersion: ""` whenever `model.baseUrl` is set
+ * ("baseUrl already includes version path, don't append"), but the Google
+ * catalog baseUrl is the bare host — so the SDK builds
+ * `https://generativelanguage.googleapis.com/models/...` without the
+ * `/v1beta` segment and Google answers 404 for every request. Append the
+ * version to the baseUrl instead.
+ */
+function versionedModel(model: Model<Api>): Model<Api> {
+  const base = typeof model.baseUrl === "string" ? model.baseUrl : "";
+  if (!base.startsWith("https://generativelanguage.googleapis.com") || /\/v\d+[a-z]*$/.test(base)) return model;
+  return { ...model, baseUrl: base.replace(/\/+$/, "") + "/v1beta" };
+}
+
+/**
+ * Repair the abort signal after `before_provider_request` transforms.
+ *
+ * The adapter receives `options.onPayload` and replaces its params with the
+ * returned payload. Payload handlers clone the params — pi-output-cap, for
+ * one, runs them through `structuredClone` — and Node's structuredClone
+ * degrades an AbortSignal to a plain `{}` (verified on node 26). The genai
+ * client then dies with
+ * `Error: callerSignal.addEventListener is not a function`
+ * inside `createAttemptSignal`, before any bytes reach the wire.
+ *
+ * Put the original signal back when the transformed payload lost it; drop the
+ * field when there was none. Non-mutating: the clone belongs to the handler
+ * chain.
+ */
+function restoreAbortSignal<T>(payload: T, signal: unknown): T {
+  const config = (payload as { config?: Record<string, unknown> } | undefined)?.config;
+  if (!config || !("abortSignal" in config) || isRealAbortSignal(config.abortSignal)) return payload;
+  const fixedConfig = { ...config, abortSignal: isRealAbortSignal(signal) ? signal : undefined };
+  return { ...(payload as object), config: fixedConfig } as T;
+}
+
+type AdapterMethod = "stream" | "streamSimple";
+
+/**
+ * Call the Google adapter with a survivable options object:
+ *
+ * 1. `sanitizeSignal` drops duck-typed turn signals (truthy, `.aborted`, no
+ *    `addEventListener`) before they reach the genai client.
+ * 2. `onPayload` is wrapped so a payload rebuilt by `before_provider_request`
+ *    handlers cannot ship a degraded `{}` abort signal to the SDK.
+ */
+function callGoogleAdapter(
+  method: AdapterMethod,
+  model: Model<Api>,
+  context: TranscriptContext,
+  options?: SimpleStreamOptions
+): AssistantMessageEventStream {
+  const clean = sanitizeSignal(options);
+  const signal = clean?.signal;
+  const origOnPayload = clean?.onPayload;
+  const callOptions: SimpleStreamOptions | undefined = origOnPayload
+    ? ({
+        ...clean,
+        onPayload: async (payload: unknown, m) =>
+          restoreAbortSignal((await origOnPayload(payload, m as never)) ?? payload, signal),
+      } as SimpleStreamOptions)
+    : clean;
+  const versioned = versionedModel(model);
+  return method === "stream"
+    ? googleStreams.stream(versioned as Model<typeof GOOGLE_API>, context, callOptions as never)
+    : googleStreams.streamSimple(versioned as Model<typeof GOOGLE_API>, context, callOptions);
+}
 
 function googleStreamSimpleFixed(
   model: Model<Api>,
   context: TranscriptContext,
   options?: SimpleStreamOptions
 ): AssistantMessageEventStream {
-  return googleStreamSimple(model as Model<typeof GOOGLE_API>, context, sanitizeSignal(options));
+  return callGoogleAdapter("streamSimple", model, context, options);
 }
 
 /** Providers whose physical models stream through the Google adapter. */
@@ -192,6 +270,20 @@ function virtualModel(
 }
 
 export default function (pi: ExtensionAPI): void {
+  // Defense in depth: also cover calls that reach the adapter through the
+  // api-provider registry (compat dispatch) instead of a composed provider.
+  // registerBuiltInApiProviders() does not clobber existing entries.
+  registerApiProvider(
+    {
+      api: GOOGLE_API,
+      stream: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
+        callGoogleAdapter("stream", model, context, options),
+      streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
+        callGoogleAdapter("streamSimple", model, context, options),
+    } as never,
+    "pi-gemini-router"
+  );
+
   // Patch every Google provider with the signal fix. No models are listed, so
   // existing model catalogs (built-in google, pi-multi-account's google-keyN)
   // stay; the extension layer only overrides streaming for the Google api.

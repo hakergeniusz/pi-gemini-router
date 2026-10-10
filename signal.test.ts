@@ -44,4 +44,9 @@ assert.ok(
 );
 assert.ok(/sanitizeSignal\(/.test(src), "streamSimple wrapper must sanitize signals");
 
+// 6. Runtime guards stay wired: versioned baseUrl + onPayload signal restore.
+assert.ok(/versionedModel\(/.test(src), "baseUrl versioning guard missing (unversioned URLs 404)");
+assert.ok(/restoreAbortSignal\(/.test(src), "onPayload signal restore missing (structuredClone degrades AbortSignal)");
+assert.ok(/onPayload/.test(src), "onPayload must be wrapped");
+
 console.log("OK — sanitize contract holds, adapter reached via compat entrypoint");
