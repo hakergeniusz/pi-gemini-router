@@ -26,6 +26,12 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel } from "@earendil-works/pi-coding-agent";
+import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
+import { googleGenerativeAIApi } from "@earendil-works/pi-ai/compat";
+import { sanitizeSignal } from "./signal.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const PROVIDER = "google";
 const KEY_PROVIDER_PATTERN = /^google-key(\d+)$/;
@@ -61,6 +67,48 @@ interface RouterState {
 
 /** Module-level epoch; `/gemini-router reset` advances it. */
 let epoch = 0;
+
+const GOOGLE_API = "google-generative-ai" as const;
+
+/**
+ * The Google adapter's streamSimple, reached through the compat entrypoint.
+ * Extension imports resolve against a fixed module table (VIRTUAL_MODULES in
+ * compiled pi builds, aliases otherwise) that maps only the pi-ai root and a
+ * few subpaths — the eager `@earendil-works/pi-ai/api/google-generative-ai`
+ * specifier is not among them, so importing it kills the whole extension at
+ * load time. The compat entrypoint is mapped everywhere and lazily loads the
+ * same adapter module on first stream call.
+ */
+const googleStreamSimple = googleGenerativeAIApi().streamSimple;
+
+function googleStreamSimpleFixed(
+  model: Model<Api>,
+  context: TranscriptContext,
+  options?: SimpleStreamOptions
+): AssistantMessageEventStream {
+  return googleStreamSimple(model as Model<typeof GOOGLE_API>, context, sanitizeSignal(options));
+}
+
+/** Providers whose physical models stream through the Google adapter. */
+function googleProviderIds(): string[] {
+  const ids = ["google"];
+  try {
+    const path = join(homedir(), ".pi", "agent", "multi-account.json");
+    if (existsSync(path)) {
+      const cfg = JSON.parse(readFileSync(path, "utf-8")) as {
+        providers?: Record<string, { api?: string; accounts?: unknown[] }>;
+      };
+      for (const [name, pc] of Object.entries(cfg.providers ?? {})) {
+        if (pc.api === GOOGLE_API && Array.isArray(pc.accounts)) {
+          for (let i = 0; i < pc.accounts.length; i++) ids.push(name + "-key" + (i + 1));
+        }
+      }
+    }
+  } catch {
+    // Config unreadable: the plain google provider is still patched.
+  }
+  return ids;
+}
 
 type RouteFn = ExtensionVirtualModel<RouterState>["route"];
 
@@ -144,6 +192,20 @@ function virtualModel(
 }
 
 export default function (pi: ExtensionAPI): void {
+  // Patch every Google provider with the signal fix. No models are listed, so
+  // existing model catalogs (built-in google, pi-multi-account's google-keyN)
+  // stay; the extension layer only overrides streaming for the Google api.
+  for (const providerId of googleProviderIds()) {
+    try {
+      pi.registerProvider(providerId, {
+        api: GOOGLE_API,
+        streamSimple: googleStreamSimpleFixed,
+      });
+    } catch (e) {
+      console.error("[gemini-router] failed to patch provider " + providerId, e);
+    }
+  }
+
   pi.registerVirtualModel(virtualModel("gemini-flash", "Gemini Flash (router)", FLASH_LADDER));
   pi.registerVirtualModel(virtualModel("gemini-flash-lite", "Gemini Flash Lite (router)", FLASH_LITE_LADDER));
 

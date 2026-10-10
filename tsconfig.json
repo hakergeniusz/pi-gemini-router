@@ -7,14 +7,30 @@
 		"strict": true,
 		"noEmit": true,
 		"skipLibCheck": true,
-		"types": ["node"],
-		"lib": ["ES2022"],
-		"baseUrl": ".",
+		"types": [
+			"node"
+		],
+		"lib": [
+			"ES2022"
+		],
 		"paths": {
 			"@earendil-works/pi-coding-agent": [
 				"/home/hakergeniusz/.local/share/npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+			],
+			"@earendil-works/pi-ai": [
+				"/home/hakergeniusz/projects/pi-hide-ext-list/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
+			],
+			"@earendil-works/pi-ai/api/*": [
+				"/home/hakergeniusz/projects/pi-hide-ext-list/node_modules/@earendil-works/pi-ai/dist/api/*"
+			],
+			"@earendil-works/pi-ai/compat": [
+				"/home/hakergeniusz/projects/pi-hide-ext-list/node_modules/@earendil-works/pi-ai/dist/compat.d.ts"
 			]
 		}
 	},
-	"include": ["index.ts"]
+	"include": [
+		"index.ts",
+		"signal.ts",
+		"signal.test.ts"
+	]
 }
