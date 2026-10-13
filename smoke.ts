@@ -6,6 +6,7 @@ const virtualModels = new Map<string, { provider: string; id: string; route: (r:
 const commands: string[] = [];
 
 const pi = {
+  registerProvider: () => {},
   registerVirtualModel: (def: { provider: string; id: string }) => {
     virtualModels.set(def.provider + "/" + def.id, def as never);
   },
@@ -25,7 +26,6 @@ const FLASH = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
-  "gemini-2.5-flash",
 ];
 const FLASH_LITE = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 const ALL = new Map<string, { provider: string; id: string }>();

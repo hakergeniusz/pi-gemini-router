@@ -4,7 +4,7 @@
  * Registers two virtual models on the `google` provider:
  *
  *   google/gemini-flash       ladder: gemini-flash-latest -> 3.8 -> 3.7 -> 3.6
- *                                  -> 3.5 -> 3-flash-preview -> 2.5-flash
+ *                                  -> 3.5 -> 3-flash-preview
  *   google/gemini-flash-lite  ladder: gemini-flash-lite-latest -> 3.5-flash-lite
  *                                  -> 3.1-flash-lite
  *
@@ -47,7 +47,6 @@ const FLASH_LADDER = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
-  "gemini-2.5-flash",
 ];
 
 const FLASH_LITE_LADDER = [

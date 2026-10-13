@@ -5,7 +5,7 @@ and rotate API keys — until something answers, and patches the Google
 provider so it works in interactive mode at all.
 
 ```
-google/gemini-flash        gemini-flash-latest → 3.8 → 3.7 → 3.6 → 3.5 → 3 → 2.5
+google/gemini-flash        gemini-flash-latest → 3.8 → 3.7 → 3.6 → 3.5 → 3
 google/gemini-flash-lite   gemini-flash-lite-latest → 3.5-flash-lite → 3.1-flash-lite
 ```
 
