@@ -21,6 +21,25 @@ google/gemini-flash-lite   gemini-flash-lite-latest → 3.5-flash-lite → 3.1-f
 - Missing `(model, key)` pairs are skipped (a key whose project lacks a model).
 - `-latest` aliases head the ladder and share the concrete model's quota bucket,
   which is why they are tried first rather than counted as extra capacity.
+- A walk covers every `(model, key)` pair exactly once. When it is complete the
+  error surfaces; the next prompt starts a fresh walk.
+
+## Quota-exhaustion rotation
+
+Pi's own retry classifier treats quota exhaustion (429 `RESOURCE_EXHAUSTED`)
+as a billing condition and never retries it, and `pi-multi-account` used to
+replace the router's virtual model with a physical `google-keyN` on failure —
+so an exhausted key ended the run instead of rotating to the next one.
+
+The router therefore takes over at `agent_before_settle`: on a rotatable
+failure (quota, rate limit, overload, 5xx, or an invalid key) it advances the
+router state to the next `(model, key)` pair, drops the failed attempt from the
+context, and asks for one more request. The walk stops once every pair has
+been tried.
+
+`pi-multi-account` no longer hijacks a selected router model either: a
+virtual (`pi-virtual`) selection keeps its router, because the router picks
+the account per request.
 
 ## The abort-signal and URL fixes
 

@@ -65,7 +65,31 @@ interface RouterState {
   k: number;
   /** Bumped by /gemini-router reset; a mismatch restarts the ladder. */
   epoch: number;
+  /**
+   * How many (model, key) pairs have failed in the current walk.
+   *
+   * A walk covers every pair exactly once; when it is complete the error
+   * surfaces instead of looping over the same exhausted keys forever.
+   */
+  tried?: number;
 }
+
+/** Custom session entry type holding the router state for a virtual model. */
+const ROUTER_STATE_ENTRY = "pi.virtual-model-state";
+
+/** The failure the `agent_before_settle` handler rotates away from. */
+interface RouterFailure {
+  /** Session entry id of the failed assistant message. */
+  entryId: string;
+  errorMessage: string;
+  /** Router state in effect when the request failed. */
+  state: RouterState;
+  /** How many (model, key) pairs have already failed in this walk. */
+  tried: number;
+}
+
+/** Latest failure, stashed at `turn_end` and consumed at `agent_before_settle`. */
+let lastFailure: RouterFailure | undefined;
 
 /** Module-level epoch; `/gemini-router reset` advances it. */
 let epoch = 0;
@@ -205,6 +229,40 @@ function ladderLabel(ladder: string[]): string {
   return ladder.join(" → ");
 }
 
+/** Errors that a different key can still answer.
+ *
+ * Pi's own retry classifier treats quota exhaustion (429 RESOURCE_EXHAUSTED)
+ * as a billing condition and never retries it, so a router that only moves on
+ * `reason === "retry"` would sit on an exhausted key forever. AI Studio
+ * quotas are per project, so the next key usually has quota left.
+ */
+const ROTATABLE_ERROR_PATTERN =
+  /429|RESOURCE_EXHAUSTED|quota|rate.?limit|too many requests|high demand|UNAVAILABLE|503|500|502|504|overloaded/i;
+
+/** Whether the failure is worth trying another key (and then model) for. */
+function isRotatableError(errorMessage: string): boolean {
+  if (!errorMessage) return false;
+  // A bad key is a permanent per-key problem: rotating the key is exactly the
+  // right response, so it is rotatable too.
+  if (/API[_ ]KEY[_ ]INVALID|API key not valid|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
+    return true;
+  }
+  return ROTATABLE_ERROR_PATTERN.test(errorMessage);
+}
+
+/** Advance the (model, key) pair by one step: key first, then model. */
+function advanceState(state: RouterState, ladderLength: number, keyCount: number): RouterState {
+  const total = Math.max(1, ladderLength * keyCount);
+  const from = state.m * keyCount + state.k;
+  const next = (from + 1) % total;
+  return {
+    m: Math.floor(next / keyCount) % ladderLength,
+    k: next % keyCount,
+    epoch,
+    tried: (state.tried ?? 0) + 1,
+  };
+}
+
 /**
  * Advance order: key index fastest, model index slowest — exhaust all keys on
  * one model before moving down the ladder. Missing (model, key) pairs (a
@@ -222,10 +280,7 @@ function makeRouter(ladder: string[]): RouteFn {
     // Only a failed request moves the pair; success, user messages and
     // continuations keep the current (model, key).
     if (request.reason === "retry" && request.failed) {
-      const total = Math.max(1, ladder.length * keyCount);
-      const from = state.m * keyCount + state.k;
-      const next = (from + 1) % total;
-      state = { m: Math.floor(next / keyCount) % ladder.length, k: next % keyCount, epoch };
+      state = advanceState(state, ladder.length, keyCount);
     }
 
     if (keys.length === 0) {
@@ -268,6 +323,47 @@ function virtualModel(
   return def;
 }
 
+/** Router state of the virtual model that is currently selected. */
+interface SelectedRouter {
+  modelId: string;
+  ladder: string[];
+}
+
+/** The ladder of the selected virtual model, if it is one of ours. */
+function selectedRouter(ctx: ExtensionContext): SelectedRouter | undefined {
+  const model = ctx.model;
+  if (!model || model.provider !== PROVIDER) return undefined;
+  if (model.id === "gemini-flash") return { modelId: model.id, ladder: FLASH_LADDER };
+  if (model.id === "gemini-flash-lite") return { modelId: model.id, ladder: FLASH_LITE_LADDER };
+  return undefined;
+}
+
+/** The router state stored on the session branch for a virtual model. */
+function routerStateOf(ctx: ExtensionContext, modelId: string): RouterState | undefined {
+  const entries = ctx.sessionManager.getEntries() as Array<{
+    type: string;
+    customType?: string;
+    data?: { provider?: string; modelId?: string; state?: RouterState };
+  }>;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "custom" || entry.customType !== ROUTER_STATE_ENTRY) continue;
+    const data = entry.data;
+    if (!data || data.provider !== PROVIDER || data.modelId !== modelId) continue;
+    return data.state;
+  }
+  return undefined;
+}
+
+/** Notify the user, tolerating contexts without UI. */
+function notify(ctx: ExtensionContext, message: string): void {
+  try {
+    ctx.ui.notify(message, "info");
+  } catch {
+    // No UI (background/direct request): the rotation still happens.
+  }
+}
+
 export default function (pi: ExtensionAPI): void {
   // Defense in depth: also cover calls that reach the adapter through the
   // api-provider registry (compat dispatch) instead of a composed provider.
@@ -299,6 +395,108 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerVirtualModel(virtualModel("gemini-flash", "Gemini Flash (router)", FLASH_LADDER));
   pi.registerVirtualModel(virtualModel("gemini-flash-lite", "Gemini Flash Lite (router)", FLASH_LITE_LADDER));
+
+  // Stash the failure (and the router state in effect) so the settle handler
+  // can advance to the next (key, model) pair.
+  pi.on("turn_end", async (event, ctx) => {
+    if (event.outcome === "error" && event.message.role === "assistant") {
+      const router = selectedRouter(ctx);
+      if (router) {
+        const state = routerStateOf(ctx, router.modelId) ?? { m: 0, k: 0, epoch };
+        lastFailure = {
+          entryId: event.messageEntryId,
+          errorMessage: (event.message as { errorMessage?: string }).errorMessage ?? "",
+          state,
+          tried: state.tried ?? 0,
+        };
+        return undefined;
+      }
+    }
+    if (event.outcome === "completed") {
+      lastFailure = undefined;
+      // A good response ends the walk: the next prompt starts a fresh one.
+      const router = selectedRouter(ctx);
+      if (router) {
+        const state = routerStateOf(ctx, router.modelId);
+        if (state && state.tried) {
+          pi.appendEntry(ROUTER_STATE_ENTRY, {
+            provider: PROVIDER,
+            modelId: router.modelId,
+            state: { ...state, tried: 0 },
+          });
+        }
+      }
+    }
+    return undefined;
+  });
+
+  // A new user prompt starts a fresh walk, so the tried counter is cleared.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    lastFailure = undefined;
+    const router = selectedRouter(ctx);
+    if (!router) return undefined;
+    const state = routerStateOf(ctx, router.modelId);
+    if (state && state.tried) {
+      pi.appendEntry(ROUTER_STATE_ENTRY, {
+        provider: PROVIDER,
+        modelId: router.modelId,
+        state: { ...state, tried: 0 },
+      });
+    }
+    return undefined;
+  });
+
+  // Pi's retry classifier treats quota exhaustion (429 RESOURCE_EXHAUSTED) as
+  // a billing condition and never retries it, so the router would sit on the
+  // exhausted key forever. Take over at `agent_before_settle`: advance the
+  // router state to the next (key, model) pair and ask for one more request.
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (event.outcome !== "error") return undefined;
+    const router = selectedRouter(ctx);
+    if (!router) return undefined;
+    const failure = lastFailure;
+    lastFailure = undefined;
+    if (!failure || !isRotatableError(failure.errorMessage)) return undefined;
+
+    const keys = keyProviders(ctx);
+    if (keys.length === 0) return undefined;
+    const keyCount = Math.max(1, keys.length);
+
+    // The walk covers every (model, key) pair exactly once. When it is
+    // complete the error surfaces instead of looping over exhausted keys.
+    const totalPairs = router.ladder.length * keyCount;
+    if (failure.tried >= totalPairs) return undefined;
+
+    const current = failure.state ?? { m: 0, k: 0, epoch };
+    const next = advanceState(current, router.ladder.length, keyCount);
+
+    // The failed attempt must leave the context, or the retry repeats it.
+    const targetPresent = event.context.contextEntries.some(
+      (entry) => entry.sourceEntry.id === failure.entryId
+    );
+    if (!targetPresent && !event.context.canContinue) return undefined;
+    const entries = targetPresent
+      ? [{ type: "context_edit" as const, targetId: failure.entryId, replacement: null }]
+      : [];
+
+    // Store the advanced state so the next routing picks the new pair.
+    pi.appendEntry(ROUTER_STATE_ENTRY, {
+      provider: PROVIDER,
+      modelId: router.modelId,
+      state: next,
+    });
+
+    notify(
+      ctx,
+      "gemini-router: " +
+        (failure.errorMessage.slice(0, 60).replace(/\s+/g, " ")) +
+        " — trying " +
+        (keys[next.k] ?? "?") +
+        " / " +
+        (router.ladder[next.m] ?? "?")
+    );
+    return { entries, continue: true };
+  });
 
   pi.registerCommand("gemini-router", {
     description: "Show the Gemini router ladders and discovered keys, or reset the ladder position",
