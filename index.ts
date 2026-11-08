@@ -26,15 +26,20 @@
  *
  * The provider patch below also keeps the Google adapter alive across two
  * abort-signal hazards (see restoreAbortSignal and sanitizeSignal).
+ *
+ * Startup cost is kept near zero: only the built-in `google` provider is
+ * patched eagerly; `google-keyN` providers are patched once they appear in
+ * the registry (session_start, then model_select for keys registered later
+ * by pi-multi-account). Re-registration merges configs, so a patch survives
+ * pi-multi-account re-registering the same provider. The pi-ai compat module
+ * (and with it the Google adapter) is imported lazily — long before the first
+ * stream, with a synchronous require as a fallback.
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
-import { googleGenerativeAIApi, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { sanitizeSignal } from "./signal.ts";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createRequire } from "node:module";
 
 const PROVIDER = "google";
 const KEY_PROVIDER_PATTERN = /^google-key(\d+)$/;
@@ -104,8 +109,45 @@ const GOOGLE_API = "google-generative-ai" as const;
  * specifier is not among them, so importing it kills the whole extension at
  * load time. The compat entrypoint is mapped everywhere and lazily loads the
  * same adapter module on first stream call.
+ *
+ * The compat module itself (~100ms of module graph) is loaded lazily: an
+ * async import kicks off at startup and lands long before the first stream;
+ * a synchronous require covers a stream that arrives before it resolves.
  */
-const googleStreams = googleGenerativeAIApi();
+type CompatModule = typeof import("@earendil-works/pi-ai/compat");
+type GoogleStreams = ReturnType<CompatModule["googleGenerativeAIApi"]>;
+
+let compatModule: CompatModule | undefined;
+let compatPreloadStarted = false;
+
+const nodeRequire = createRequire(import.meta.url);
+
+function ensureCompat(): CompatModule {
+	if (!compatModule) {
+		compatModule = nodeRequire("@earendil-works/pi-ai/compat") as CompatModule;
+	}
+	return compatModule;
+}
+
+function getStreams(): GoogleStreams {
+	return ensureCompat().googleGenerativeAIApi();
+}
+
+/** Kick off the async compat import; registers the compat api entry on arrival. */
+function preloadCompat(): void {
+	if (compatModule || compatPreloadStarted) return;
+	compatPreloadStarted = true;
+	void import("@earendil-works/pi-ai/compat")
+		.then((compat) => {
+			compatModule = compat;
+			registerCompatApiEntry();
+			if (process.env.PI_GR_DEBUG === "1") console.error("[gemini-router] compat module loaded lazily");
+		})
+		.catch(() => {
+			// Async import unavailable in this runtime — ensureCompat() covers the
+			// stream path with a synchronous require.
+		});
+}
 
 /** True only for real AbortSignals; false for `{}` clones and duck types. */
 function isRealAbortSignal(value: unknown): value is AbortSignal {
@@ -177,9 +219,10 @@ function callGoogleAdapter(
       } as SimpleStreamOptions)
     : clean;
   const versioned = versionedModel(model);
+  const streams = getStreams();
   return method === "stream"
-    ? googleStreams.stream(versioned as Model<typeof GOOGLE_API>, context, callOptions as never)
-    : googleStreams.streamSimple(versioned as Model<typeof GOOGLE_API>, context, callOptions);
+    ? streams.stream(versioned as Model<typeof GOOGLE_API>, context, callOptions as never)
+    : streams.streamSimple(versioned as Model<typeof GOOGLE_API>, context, callOptions);
 }
 
 function googleStreamSimpleFixed(
@@ -190,25 +233,27 @@ function googleStreamSimpleFixed(
   return callGoogleAdapter("streamSimple", model, context, options);
 }
 
-/** Providers whose physical models stream through the Google adapter. */
-function googleProviderIds(): string[] {
-  const ids = ["google"];
+/**
+ * Register the patched adapter in pi-ai's api-provider registry, so calls that
+ * reach Google through compat dispatch get the same fixes as composed-provider
+ * calls. Runs once the lazy compat import resolves (registerApiProvider comes
+ * from that module).
+ */
+function registerCompatApiEntry(): void {
   try {
-    const path = join(homedir(), ".pi", "agent", "multi-account.json");
-    if (existsSync(path)) {
-      const cfg = JSON.parse(readFileSync(path, "utf-8")) as {
-        providers?: Record<string, { api?: string; accounts?: unknown[] }>;
-      };
-      for (const [name, pc] of Object.entries(cfg.providers ?? {})) {
-        if (pc.api === GOOGLE_API && Array.isArray(pc.accounts)) {
-          for (let i = 0; i < pc.accounts.length; i++) ids.push(name + "-key" + (i + 1));
-        }
-      }
-    }
-  } catch {
-    // Config unreadable: the plain google provider is still patched.
+    ensureCompat().registerApiProvider(
+      {
+        api: GOOGLE_API,
+        stream: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
+          callGoogleAdapter("stream", model, context, options),
+        streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
+          callGoogleAdapter("streamSimple", model, context, options),
+      } as never,
+      "pi-gemini-router"
+    );
+  } catch (e) {
+    console.error("[gemini-router] failed to register compat api entry", e);
   }
-  return ids;
 }
 
 type RouteFn = ExtensionVirtualModel<RouterState>["route"];
@@ -364,37 +409,65 @@ function notify(ctx: ExtensionContext, message: string): void {
   }
 }
 
-export default function (pi: ExtensionAPI): void {
-  // Defense in depth: also cover calls that reach the adapter through the
-  // api-provider registry (compat dispatch) instead of a composed provider.
-  // registerBuiltInApiProviders() does not clobber existing entries.
-  registerApiProvider(
-    {
-      api: GOOGLE_API,
-      stream: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
-        callGoogleAdapter("stream", model, context, options),
-      streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
-        callGoogleAdapter("streamSimple", model, context, options),
-    } as never,
-    "pi-gemini-router"
-  );
+/** Google-ish providers already patched with the signal-safe streamSimple. */
+const patchedProviders = new Set<string>();
 
-  // Patch every Google provider with the signal fix. No models are listed, so
-  // existing model catalogs (built-in google, pi-multi-account's google-keyN)
-  // stay; the extension layer only overrides streaming for the Google api.
-  for (const providerId of googleProviderIds()) {
-    try {
-      pi.registerProvider(providerId, {
-        api: GOOGLE_API,
-        streamSimple: googleStreamSimpleFixed,
-      });
-    } catch (e) {
-      console.error("[gemini-router] failed to patch provider " + providerId, e);
-    }
+/**
+ * Patch one Google provider with the signal-safe streaming. No models are
+ * listed, so existing model catalogs stay; the extension layer only overrides
+ * streaming for the Google api. Re-registration merges configs, so this
+ * survives pi-multi-account re-registering the same provider.
+ */
+function patchGoogleProvider(pi: ExtensionAPI, providerId: string): void {
+  if (patchedProviders.has(providerId)) return;
+  patchedProviders.add(providerId);
+  try {
+    pi.registerProvider(providerId, {
+      api: GOOGLE_API,
+      streamSimple: googleStreamSimpleFixed,
+    });
+    if (process.env.PI_GR_DEBUG === "1") console.error("[gemini-router] patched " + providerId);
+  } catch (e) {
+    patchedProviders.delete(providerId);
+    console.error("[gemini-router] failed to patch provider " + providerId, e);
   }
+}
+
+export default function (pi: ExtensionAPI): void {
+  // The compat module (and its ~100ms module graph) loads in the background;
+  // it also registers the patched adapter in pi-ai's api-provider registry so
+  // compat-dispatched calls get the same fixes. registerBuiltInApiProviders()
+  // does not clobber existing entries.
+  preloadCompat();
+
+  // Only patch paid at startup: the built-in google provider. Each
+  // registerProvider triggers pi's model snapshot rebuild, so google-keyN
+  // providers are patched when they actually appear in the registry instead
+  // of being created eagerly as empty providers.
+  patchGoogleProvider(pi, "google");
 
   pi.registerVirtualModel(virtualModel("gemini-flash", "Gemini Flash (router)", FLASH_LADDER));
   pi.registerVirtualModel(virtualModel("gemini-flash-lite", "Gemini Flash Lite (router)", FLASH_LITE_LADDER));
+
+  // By now pi-multi-account has registered google-key1; patch every
+  // Google-ish provider that has models in the registry.
+  pi.on("session_start", ((_event: unknown, ctx: ExtensionContext) => {
+    const providers = new Set<string>([PROVIDER]);
+    for (const m of ctx.modelRegistry.getAll()) {
+      if (KEY_PROVIDER_PATTERN.test(m.provider) || m.provider === PROVIDER) providers.add(m.provider);
+    }
+    for (const providerId of providers) patchGoogleProvider(pi, providerId);
+  }) as never);
+
+  // Keys registered later (pi-multi-account account switches) get patched the
+  // moment they are selected, before anything streams through them.
+  pi.on("model_select", ((event: { model?: { provider?: string } }) => {
+    const provider = event.model?.provider;
+    if (!provider) return;
+    if (provider === PROVIDER || KEY_PROVIDER_PATTERN.test(provider)) {
+      patchGoogleProvider(pi, provider);
+    }
+  }) as never);
 
   // Stash the failure (and the router state in effect) so the settle handler
   // can advance to the next (key, model) pair.
