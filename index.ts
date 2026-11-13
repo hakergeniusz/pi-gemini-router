@@ -53,7 +53,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel } from "@ear
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { sanitizeSignal } from "./signal.ts";
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -85,6 +85,8 @@ interface RouterConfig {
   ladders?: Partial<Record<"gemini-flash" | "gemini-flash-lite", string[]>>;
   /** `key-first` (default): exhaust all keys on one model, then the next model. `model-first`: walk the ladder per key. */
   order?: "key-first" | "model-first";
+  /** Quota awareness (default on): remember 429 hits per (model, key) pair and skip RPD-dead pairs until the daily reset. */
+  quotaAware?: boolean;
 }
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "gemini-router.json");
@@ -111,6 +113,159 @@ function flashLiteLadder(): string[] {
 
 function advanceOrder(): "key-first" | "model-first" {
   return routerConfig.order === "model-first" ? "model-first" : "key-first";
+}
+
+function quotaAware(): boolean {
+  return routerConfig.quotaAware !== false;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Quota awareness
+ *
+ * AI Studio free-tier quotas are per model AND per project (one project per
+ * multi-account key), and the daily bucket (RPD) resets at midnight Pacific.
+ * A 429 therefore means "this pair is done for hours", not "try again now" —
+ * so record the hit per pair and let the walk skip dead pairs instead of
+ * re-burning a request on each of them every prompt.
+ *
+ * Classification from the error body (real 429 bodies carry all of it):
+ *   - `PerDay` / "per day" (quotaId GenerateRequestsPerDay…) → dead until the
+ *     next midnight PT, persisted across restarts.
+ *   - "per minute" / `Please retry in Xs` (RPM and TPM buckets) → cooling for
+ *     the retry hint (capped at 120s), no persistence needed.
+ *   - Any other quota-flavored 429 → "possibly RPD": probe TTL of 30 minutes.
+ *
+ * A successful response on a pair clears its marks (self-healing).
+ * ------------------------------------------------------------------------- */
+
+const QUOTA_PATH = join(homedir(), ".pi", "agent", "gemini-router-quota.json");
+const SUSPECTED_RPD_TTL_MS = 30 * 60 * 1000;
+const MINUTE_COOLDOWN_DEFAULT_MS = 75 * 1000;
+const MINUTE_COOLDOWN_MAX_MS = 120 * 1000;
+
+type QuotaKind = "rpd" | "minute" | "suspected";
+
+interface QuotaMark {
+  kind: QuotaKind;
+  /** Epoch ms until which the pair is considered dead. */
+  until: number;
+}
+
+/** Pair id: `<model>|<provider>` (provider = google-keyN). */
+type QuotaMarks = Record<string, QuotaMark>;
+
+let quotaMarks: QuotaMarks = {};
+
+function pairKey(modelId: string, provider: string): string {
+  return modelId + "|" + provider;
+}
+
+function loadQuotaMarks(): void {
+  try {
+    const raw = JSON.parse(readFileSync(QUOTA_PATH, "utf-8")) as QuotaMarks;
+    const now = Date.now();
+    quotaMarks = {};
+    for (const [key, mark] of Object.entries(raw)) {
+      if (mark && typeof mark.until === "number" && mark.until > now) quotaMarks[key] = mark;
+    }
+  } catch {
+    quotaMarks = {};
+  }
+}
+
+function saveQuotaMarks(): void {
+  try {
+    const now = Date.now();
+    const pruned: QuotaMarks = {};
+    for (const [key, mark] of Object.entries(quotaMarks)) {
+      if (mark.until > now) pruned[key] = mark;
+    }
+    quotaMarks = pruned;
+    writeFileSync(QUOTA_PATH, JSON.stringify(pruned, null, 1) + "\n");
+  } catch {
+    // Persistence is best-effort: in-memory marks still cover this session.
+  }
+}
+
+/** Wall-clock offset of America/Los_Angeles at the given epoch (ms). */
+function pacificOffsetMs(epochMs: number): number {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const parts: Record<string, string> = {};
+  for (const p of dtf.formatToParts(new Date(epochMs))) parts[p.type] = p.value;
+  const asUTC = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour), Number(parts.minute), Number(parts.second)
+  );
+  return asUTC - Math.floor(epochMs / 1000) * 1000;
+}
+
+/** Epoch ms of the next 00:00 in America/Los_Angeles (free-tier RPD reset). */
+function nextPacificMidnight(epochMs: number): number {
+  const offset = pacificOffsetMs(epochMs);
+  const wall = epochMs + offset;
+  const nextDayWall = Math.floor(wall / 86400000) * 86400000 + 86400000;
+  return nextDayWall - offset;
+}
+
+/** Classify a 429/quota error into a mark, or undefined when not quota-flavored. */
+function quotaMarkOf(errorMessage: string): QuotaMark | undefined {
+  if (!/429|RESOURCE_EXHAUSTED|quota|rate.?limit|too many requests/i.test(errorMessage)) return undefined;
+  const now = Date.now();
+  // Daily buckets first: they outrank any retry hint inside the same body.
+  if (/PerDay|requests? per day|RequestsPerDay/i.test(errorMessage)) {
+    return { kind: "rpd", until: nextPacificMidnight(now) };
+  }
+  if (/per minute|PerMinute/i.test(errorMessage)) {
+    return { kind: "minute", until: now + MINUTE_COOLDOWN_DEFAULT_MS };
+  }
+  // Google usually says how long the per-minute window needs: "Please retry in 33.81s".
+  const retryIn = errorMessage.match(/retry in ([0-9.]+)\s*s/i);
+  if (retryIn) {
+    const ms = Math.min(MINUTE_COOLDOWN_MAX_MS, Math.max(5000, Number(retryIn[1]) * 1000 + 3000));
+    return { kind: "minute", until: now + ms };
+  }
+  // Ambiguous quota 429: possibly RPD — probe again after a while.
+  return { kind: "suspected", until: now + SUSPECTED_RPD_TTL_MS };
+}
+
+/** Record a 429 hit against one (model, key) pair. */
+function recordQuotaHit(provider: string, modelId: string, errorMessage: string): QuotaMark | undefined {
+  const mark = quotaMarkOf(errorMessage);
+  if (!mark) return undefined;
+  quotaMarks[pairKey(modelId, provider)] = mark;
+  saveQuotaMarks();
+  return mark;
+}
+
+/** True when the pair has no live mark (RPD-dead or cooling). */
+function isPairDead(modelId: string, provider: string): boolean {
+  const mark = quotaMarks[pairKey(modelId, provider)];
+  return !!mark && mark.until > Date.now();
+}
+
+/** A success proves the pair is alive: drop its marks. */
+function clearQuotaHit(provider: string, modelId: string): void {
+  if (quotaMarks[pairKey(modelId, provider)]) {
+    delete quotaMarks[pairKey(modelId, provider)];
+    saveQuotaMarks();
+  }
+}
+
+/** Humanized remaining time for status output. */
+function remainingLabel(mark: QuotaMark): string {
+  const leftMs = mark.until - Date.now();
+  const mins = Math.max(0, Math.round(leftMs / 60000));
+  if (mins >= 60) return `${Math.floor(mins / 60)}h ${mins % 60}m left`;
+  return `${mins}m left`;
 }
 
 interface RouterState {
@@ -440,7 +595,13 @@ function advanceState(
   };
 }
 
-/** Missing (model, key) pairs (a provider without that catalog entry) are skipped. */
+/** Missing (model, key) pairs (a provider without that catalog entry) are skipped.
+ *
+ * Quota-aware: pairs with a live mark (RPD-dead until midnight PT, per-minute
+ * cooling, or a suspected quota 429) are also skipped without burning a
+ * request. When every pair is marked, the walk falls back to the held pair
+ * and lets the network decide — stale marks must never brick the router.
+ */
 function makeRouter(ladderOf: () => string[]): RouteFn {
   return function route(request, ctx) {
     let state: RouterState =
@@ -460,6 +621,17 @@ function makeRouter(ladderOf: () => string[]): RouteFn {
     // Only a failed request moves the pair; success, user messages and
     // continuations keep the current (model, key).
     if (request.reason === "retry" && request.failed) {
+      // Record what the failure means for this pair's quota before moving on.
+      const failed = request.failed as { provider?: unknown; model?: unknown; errorMessage?: unknown } | undefined;
+      if (
+        quotaAware() &&
+        failed &&
+        typeof failed.provider === "string" &&
+        typeof failed.model === "string" &&
+        typeof failed.errorMessage === "string"
+      ) {
+        recordQuotaHit(failed.provider, failed.model, failed.errorMessage);
+      }
       state = advanceState(state, ladder.length, keyCount, order);
     }
 
@@ -468,14 +640,20 @@ function makeRouter(ladderOf: () => string[]): RouteFn {
       order === "model-first"
         ? state.k * ladder.length + state.m
         : state.m * keys.length + state.k;
+    const aware = quotaAware();
+    let fallback: { m: number; k: number; model: Model<Api> } | undefined;
     for (let step = 0; step < total; step++) {
       const idx = (from + step) % total;
       const m = order === "model-first" ? idx % ladder.length : Math.floor(idx / keys.length) % ladder.length;
       const k = order === "model-first" ? Math.floor(idx / ladder.length) % keys.length : idx % keys.length;
       const model = ctx.modelRegistry.find(keys[k], ladder[m]);
-      if (model) {
-        return { model, thinkingLevel: request.thinkingLevel, state: { m, k, epoch } };
-      }
+      if (!model) continue;
+      if (!fallback) fallback = { m, k, model };
+      if (aware && isPairDead(ladder[m], keys[k])) continue;
+      return { model, thinkingLevel: request.thinkingLevel, state: { m, k, epoch } };
+    }
+    if (fallback) {
+      return { model: fallback.model, thinkingLevel: request.thinkingLevel, state: { m: fallback.m, k: fallback.k, epoch } };
     }
     throw new Error(
       "gemini-router: ladder exhausted — none of [" + ladderLabel(ladder) + "] found on " + keys.join(", ")
@@ -568,6 +746,7 @@ function patchGoogleProvider(pi: ExtensionAPI, providerId: string): void {
 
 export default function (pi: ExtensionAPI): void {
   loadConfig();
+  loadQuotaMarks();
 
   // The compat module (and its ~100ms module graph) loads in the background;
   // it also registers the patched adapter in pi-ai's api-provider registry so
@@ -589,6 +768,7 @@ export default function (pi: ExtensionAPI): void {
   // edits without a restart.
   pi.on("session_start", ((_event: unknown, ctx: ExtensionContext) => {
     loadConfig();
+    loadQuotaMarks();
     const providers = new Set<string>([PROVIDER]);
     for (const m of ctx.modelRegistry.getAll()) {
       if (KEY_PROVIDER_PATTERN.test(m.provider) || m.provider === PROVIDER) providers.add(m.provider);
@@ -628,12 +808,19 @@ export default function (pi: ExtensionAPI): void {
       const router = selectedRouter(ctx);
       if (router) {
         const state = routerStateOf(ctx, router.modelId);
-        if (state && state.tried) {
-          pi.appendEntry(ROUTER_STATE_ENTRY, {
-            provider: PROVIDER,
-            modelId: router.modelId,
-            state: { ...state, tried: 0 },
-          });
+        if (state) {
+          // The pair just answered — any quota mark against it is stale.
+          const keys = keyProviders(ctx);
+          const keyId = keys[state.k];
+          const modelId = router.ladder[state.m];
+          if (keyId && modelId) clearQuotaHit(keyId, modelId);
+          if (state.tried) {
+            pi.appendEntry(ROUTER_STATE_ENTRY, {
+              provider: PROVIDER,
+              modelId: router.modelId,
+              state: { ...state, tried: 0 },
+            });
+          }
         }
       }
     }
@@ -680,6 +867,22 @@ export default function (pi: ExtensionAPI): void {
     const current = failure.state ?? { m: 0, k: 0, epoch };
     const next = advanceState(current, router.ladder.length, keyCount, advanceOrder());
 
+    // Record what this failure means for the failed pair's quota (route()
+    // only sees pi's own retries; settle rotations are recorded here).
+    let quotaNote = "";
+    if (quotaAware() && failure.state) {
+      const failedModel = router.ladder[failure.state.m];
+      const failedKey = keys[failure.state.k];
+      if (failedModel && failedKey) {
+        const mark = recordQuotaHit(failedKey, failedModel, failure.errorMessage);
+        if (mark && mark.kind === "rpd") {
+          quotaNote = " (" + failedModel + "/" + failedKey + " RPD-dead until midnight PT, " + remainingLabel(mark) + ")";
+        } else if (mark && mark.kind === "suspected") {
+          quotaNote = " (possibly RPD — " + failedModel + "/" + failedKey + " skipped for " + remainingLabel(mark) + ")";
+        }
+      }
+    }
+
     // The failed attempt must leave the context, or the retry repeats it.
     const targetPresent = event.context.contextEntries.some(
       (entry) => entry.sourceEntry.id === failure.entryId
@@ -703,13 +906,14 @@ export default function (pi: ExtensionAPI): void {
         " — trying " +
         (keys[next.k] ?? "?") +
         " / " +
-        (router.ladder[next.m] ?? "?")
+        (router.ladder[next.m] ?? "?") +
+        quotaNote
     );
     return { entries, continue: true };
   });
 
   pi.registerCommand("gemini-router", {
-    description: "Show the Gemini router ladders and discovered keys, or reset the ladder position",
+    description: "Show the Gemini router ladders, discovered keys, and quota marks; or reset",
     handler: async (args: string, ctx: ExtensionContext) => {
       const cmd = (args || "").trim().toLowerCase();
       if (cmd === "reset") {
@@ -718,6 +922,12 @@ export default function (pi: ExtensionAPI): void {
           "gemini-router: reset — next request starts at the ladder head on key1",
           "info"
         );
+        return;
+      }
+      if (cmd === "quota-reset") {
+        quotaMarks = {};
+        saveQuotaMarks();
+        ctx.ui.notify("gemini-router: quota marks cleared — every pair is considered live again", "info");
         return;
       }
       const keys = keyProviders(ctx);
@@ -729,8 +939,29 @@ export default function (pi: ExtensionAPI): void {
         "  gemini-flash-lite  " + ladderLabel(flashLiteLadder()) + (liteFromConfig ? "  [config]" : ""),
         "keys discovered: " + (keys.length ? keys.join(", ") : "none — configure google accounts in multi-account.json"),
         "advance: " + advanceOrder() + " (" + (advanceOrder() === "key-first" ? "all keys on one model, then next model" : "whole ladder per key, then next key") + "); holds (model, key) until it errors",
-        "/gemini-router reset — restart at the ladder head on key1",
       ];
+      const byKind = (kind: QuotaKind) => {
+        const entries = Object.entries(quotaMarks)
+          .filter(([, mark]) => mark.kind === kind && mark.until > Date.now())
+          .map(([key, mark]) => key + " (" + remainingLabel(mark) + ")");
+        return entries;
+      };
+      const rpd = byKind("rpd");
+      const suspected = byKind("suspected");
+      const minute = byKind("minute");
+      lines.push(
+        "quota awareness: " + (quotaAware() ? "on" : "off") + " (" + QUOTA_PATH + ")"
+      );
+      lines.push(
+        "  RPD-dead until midnight PT: " + (rpd.length ? rpd.join(", ") : "none")
+      );
+      lines.push(
+        "  possibly RPD (probe " + Math.round(SUSPECTED_RPD_TTL_MS / 60000) + "m): " + (suspected.length ? suspected.join(", ") : "none")
+      );
+      lines.push(
+        "  cooling (per-minute): " + (minute.length ? minute.join(", ") : "none")
+      );
+      lines.push("/gemini-router reset — restart at the ladder head on key1; quota-reset — clear quota marks");
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

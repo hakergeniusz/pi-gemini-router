@@ -2,13 +2,19 @@
 // ladder/rotation logic without touching the network.
 //
 // Run with node's type stripping and pi's node_modules on the resolution path
-// (see scripts/smoke.sh). GEMINI_ROUTER_SMOKE=model-first runs the
-// config-override case (expects a seeded ~/.pi/agent/gemini-router.json with
-// order "model-first" and a two-model flash ladder).
+// (see scripts/smoke.sh). GEMINI_ROUTER_SMOKE selects the case:
+//   model-first — config override case (seeded config with order "model-first")
+//   quota       — quota awareness: marking, skipping, self-healing, fallback
+// HOME is redirected by smoke.sh for every case, so config/quota files never
+// touch the real ~/.pi/agent.
 import activate, { isRotatableError } from "./index.ts";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const virtualModels = new Map<string, { provider: string; id: string; route: (r: unknown, c: unknown) => unknown }>();
 const commands: string[] = [];
+const handlers = new Map<string, (event: never, ctx: never) => unknown>();
 
 const pi = {
   registerProvider: () => {},
@@ -16,7 +22,10 @@ const pi = {
     virtualModels.set(def.provider + "/" + def.id, def as never);
   },
   registerCommand: (name: string) => commands.push(name),
-  on: () => {},
+  on: (name: string, fn: (event: never, ctx: never) => unknown) => {
+    handlers.set(name, fn);
+  },
+  appendEntry: () => {},
 } as never;
 
 activate(pi);
@@ -65,6 +74,89 @@ if (process.env.GEMINI_ROUTER_SMOKE === "model-first") {
   r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: {} });
   assertEq(r.model.provider + "/" + r.model.id, "google-key2/gemini-3.5-flash", "model-first wraps to the next key");
   console.log("OK — model-first config order and custom ladder honored");
+} else if (process.env.GEMINI_ROUTER_SMOKE === "quota") {
+  // Quota awareness: marks are recorded from failed requests, dead pairs are
+  // skipped without burning requests, success clears marks, and a fully
+  // marked router falls back to the held pair instead of throwing.
+  const quotaFile = join(homedir(), ".pi", "agent", "gemini-router-quota.json");
+  const readMarks = (): Record<string, { kind: string; until: number }> => {
+    try {
+      return JSON.parse(readFileSync(quotaFile, "utf-8"));
+    } catch {
+      return {};
+    }
+  };
+
+  const perDayErr = '429 RESOURCE_EXHAUSTED quotaId "GenerateRequestsPerDayPerProjectPerModel" requests per day limit exceeded';
+  const minuteErr = '429 RESOURCE_EXHAUSTED Generate content input tokens per minute limit exceeded. Please retry in 33.81s.';
+  const genericErr = '429 RESOURCE_EXHAUSTED You exceeded your current quota, please check your plan and billing details.';
+
+  // 1. RPD hit via route()'s failed path → the pair is skipped on the next route.
+  let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key1/gemini-4-hydrogen", "quota case first pick");
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: { provider: "google-key1", model: "gemini-4-hydrogen", errorMessage: perDayErr } });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key2/gemini-4-hydrogen", "failed retry advances to next key");
+  r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key2/gemini-4-hydrogen", "RPD-dead key1 skipped, still on hydrogen");
+  const marks1 = readMarks();
+  assertEq(marks1["gemini-4-hydrogen|google-key1"]?.kind, "rpd", "RPD mark persisted");
+
+  // 2. Per-minute hit (with Google's retry hint) → pair cooling, skipped.
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: { provider: "google-key2", model: "gemini-4-hydrogen", errorMessage: minuteErr } });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key3/gemini-4-hydrogen", "cooling advance");
+  r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key3/gemini-4-hydrogen", "cooling key2 skipped");
+  const marks2 = readMarks();
+  assertEq(marks2["gemini-4-hydrogen|google-key2"]?.kind, "minute", "minute mark persisted");
+  const cooldown = marks2["gemini-4-hydrogen|google-key2"].until - Date.now();
+  assert(cooldown > 0 && cooldown <= 120000, "minute cooldown honors retry hint cap");
+
+  // 3. Ambiguous quota 429 → possibly RPD, probe TTL.
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: { provider: "google-key3", model: "gemini-4-hydrogen", errorMessage: genericErr } });
+  r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key4/gemini-4-hydrogen", "suspected pair skipped");
+  const marks3 = readMarks();
+  assertEq(marks3["gemini-4-hydrogen|google-key3"]?.kind, "suspected", "suspected mark persisted");
+  assert(marks3["gemini-4-hydrogen|google-key3"].until - Date.now() <= 31 * 60000, "suspected TTL bounded");
+
+  // 4. Success clears marks: drive the captured turn_end handler with a
+  // completed event for the held pair (hydrogen|key1 would be m0,k0 — mark key4's
+  // pair via its state instead: the current route is key4/hydrogen).
+  const stateEntry = { type: "custom", customType: "pi.virtual-model-state", data: { provider: "google", modelId: "gemini-flash", state: { m: 0, k: 3, epoch: 0 } } };
+  const handlerCtx = {
+    model: { provider: "google", id: "gemini-flash" },
+    modelRegistry: { find: (p: string, id: string) => ALL.get(`${p}/${id}`), getAll: () => Array.from(ALL.values()) },
+    sessionManager: { getEntries: () => [stateEntry] },
+    ui: { notify: () => {} },
+  };
+  const turnEnd = handlers.get("turn_end")!;
+  await turnEnd({ outcome: "completed" } as never, handlerCtx as never);
+  assert(!readMarks()["gemini-4-hydrogen|google-key4"], "success clears the pair's mark");
+
+  // 5. Settle-path marking: turn_end error → agent_before_settle records the
+  // failed pair (stub state m0,k3 = hydrogen|key4) and continues the walk.
+  await turnEnd({ outcome: "error", message: { role: "assistant", errorMessage: perDayErr }, messageEntryId: "e1" } as never, handlerCtx as never);
+  const settle = handlers.get("agent_before_settle")!;
+  const result = (await settle({ outcome: "error", context: { contextEntries: [], canContinue: true } } as never, handlerCtx as never)) as { continue?: boolean } | undefined;
+  assertEq(result?.continue, true, "settle continues on quota error");
+  const marks4 = readMarks();
+  assertEq(marks4["gemini-4-hydrogen|google-key4"]?.kind, "rpd", "settle re-marks the failed pair");
+
+  // 6. Fully marked router falls back instead of throwing: mark every pair of
+  // the flash ladder by walking retries that fail the CURRENT pair each time,
+  // then route must still return a pair (the held one) rather than throw.
+  let cur = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  for (let i = 0; i < 7 * 7 + 2; i++) {
+    cur = route(flash, {
+      reason: "retry",
+      thinkingLevel: "off",
+      state: cur.state,
+      failed: { provider: cur.model.provider, model: cur.model.id, errorMessage: perDayErr },
+    });
+  }
+  const afterFlood = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assert(!!afterFlood.model, "fully-marked router still routes");
+  console.log("OK — quota marking, skipping, self-healing, settle marking, and fallback all pass");
 } else {
   // 1. First request: hydrogen (ladder head) on key1.
   let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });

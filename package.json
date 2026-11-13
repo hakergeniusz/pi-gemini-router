@@ -1,6 +1,6 @@
 {
 	"name": "pi-gemini-router",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Adds gemini-flash and gemini-flash-lite router models that fall back across flash generations and API keys until one answers.",
 	"type": "module",
 	"license": "MIT",

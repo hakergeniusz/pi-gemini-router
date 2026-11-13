@@ -26,6 +26,28 @@ advance order (picked up on session start):
 
 `order` is `key-first` (default: exhaust all keys on one model before the
 next model) or `model-first` (walk the ladder per key before the next key).
+`quotaAware: false` turns quota marking off.
+
+## Quota awareness
+
+Free-tier quotas are per model *and* per project (one project per
+multi-account key), and the daily bucket resets at midnight Pacific. A 429
+therefore means "this pair is done for hours" — so the router records hits
+per `(model, key)` pair in `~/.pi/agent/gemini-router-quota.json` and skips
+dead pairs instead of re-burning a request on each of them every prompt:
+
+- **RPD** (`PerDay` / "per day" in the error body) → pair dead until the next
+  midnight PT; the mark persists across restarts and expires by itself.
+- **Per-minute** (RPM/TPM — Google's body usually says `Please retry in Xs`)
+  → pair cooling for the hint duration (capped at 120s).
+- **Ambiguous quota 429** → *possibly RPD*: skipped with a 30-minute probe
+  TTL, then retried.
+- A **successful response** on a pair clears its marks (self-healing).
+- If every pair ends up marked, the walk falls back to the held pair and lets
+  the network decide — stale marks never brick the router.
+
+`/gemini-router` shows the current marks (RPD-dead / possibly RPD / cooling);
+`/gemini-router quota-reset` clears them.
 
 ## Behavior
 
@@ -110,8 +132,9 @@ models is ~840 flash requests/day before key rotation.
 ## Commands
 
 ```
-/gemini-router          # show ladders, advance order, and discovered google-keyN providers
-/gemini-router reset    # restart at the ladder head on key1 (post-quota-reset)
+/gemini-router             # show ladders, advance order, discovered keys, quota marks
+/gemini-router reset       # restart at the ladder head on key1 (post-quota-reset)
+/gemini-router quota-reset # clear all quota marks (pairs considered live again)
 ```
 
 Router state lives on the session branch, so it survives compaction and resumes;
@@ -129,5 +152,6 @@ extensions. Requires the `google` accounts in
 cd ~/Projects/pi-gemini-router && ./node_modules/.bin/tsc --noEmit
 scripts/smoke.sh                # routing ladder, rotation, rotatable errors
 scripts/smoke.sh model-first    # config override case (order + custom ladder)
+scripts/smoke.sh quota          # quota awareness (marks, skipping, self-heal, fallback)
 cd ~/Projects/pi-gemini-router && bun signal.test.ts
 ```
