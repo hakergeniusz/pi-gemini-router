@@ -5,9 +5,27 @@ and rotate API keys — until something answers, and patches the Google
 provider so it works in interactive mode at all.
 
 ```
-google/gemini-flash        gemini-flash-latest → 3.8 → 3.7 → 3.6 → 3.5 → 3
+google/gemini-flash        gemini-4-hydrogen → flash-latest → 3.8 → 3.7 → 3.6 → 3.5 → 3
 google/gemini-flash-lite   gemini-flash-lite-latest → 3.5-flash-lite → 3.1-flash-lite
 ```
+
+## Configuration
+
+Optional `~/.pi/agent/gemini-router.json` overrides the ladders and the
+advance order (picked up on session start):
+
+```json
+{
+  "ladders": {
+    "gemini-flash": ["gemini-4-hydrogen", "gemini-flash-latest", "gemini-3.8-flash"],
+    "gemini-flash-lite": ["gemini-flash-lite-latest", "gemini-3.5-flash-lite"]
+  },
+  "order": "key-first"
+}
+```
+
+`order` is `key-first` (default: exhaust all keys on one model before the
+next model) or `model-first` (walk the ladder per key before the next key).
 
 ## Behavior
 
@@ -17,10 +35,11 @@ google/gemini-flash-lite   gemini-flash-lite-latest → 3.5-flash-lite → 3.1-f
   user messages and continuations do not move it.
 - On failure it tries the **same model on the next key**; only after every key
   has failed for that model does it move down the model ladder (restarting on
-  key1).
+  key1). `order: "model-first"` flips this (ladder first, then keys).
 - Missing `(model, key)` pairs are skipped (a key whose project lacks a model).
-- `-latest` aliases head the ladder and share the concrete model's quota bucket,
-  which is why they are tried first rather than counted as extra capacity.
+- `-latest` aliases sit near the ladder head and share the concrete model's
+  quota bucket, which is why they are tried early rather than counted as
+  extra capacity.
 - A walk covers every `(model, key)` pair exactly once. When it is complete the
   error surfaces; the next prompt starts a fresh walk.
 
@@ -32,10 +51,24 @@ replace the router's virtual model with a physical `google-keyN` on failure —
 so an exhausted key ended the run instead of rotating to the next one.
 
 The router therefore takes over at `agent_before_settle`: on a rotatable
-failure (quota, rate limit, overload, 5xx, or an invalid key) it advances the
-router state to the next `(model, key)` pair, drops the failed attempt from the
-context, and asks for one more request. The walk stops once every pair has
-been tried.
+failure (quota, rate limit, overload, 5xx, an invalid key, or a pair-specific
+400/404 — model not available for that project, strict signature rejection,
+retired model) it advances the router state to the next `(model, key)` pair,
+drops the failed attempt from the context, and asks for one more request. The
+walk stops once every pair has been tried. Context-overflow 400s do **not**
+rotate: no pair can serve them, so they are left to pi's compaction.
+
+## The thought-signature fix
+
+pi-ai only replays `thoughtSignature`s when the history comes from the exact
+same provider+model (`resolveThoughtSignature`), so every model switch — the
+router's core job — leaves all prior `functionCall` parts unsigned, and strict
+Gemini 3/4 models answer 400 `Function call is missing a thought_signature`.
+Google special-cases the sentinel value `skip_thought_signature_validator`
+(verified live: any other non-base64 value fails the TYPE_BYTES base64 check;
+the sentinel passes and is accepted by 3.5-flash and 4-hydrogen). The wrapped
+`onPayload` injects it into every unsigned function call of Gemini 3+ models
+before the request is sent.
 
 `pi-multi-account` no longer hijacks a selected router model either: a
 virtual (`pi-virtual`) selection keeps its router, because the router picks
@@ -77,8 +110,8 @@ models is ~840 flash requests/day before key rotation.
 ## Commands
 
 ```
-/gemini-router          # show ladders and discovered google-keyN providers
-/gemini-router reset    # restart at gemini-flash-latest on key1 (post-quota-reset)
+/gemini-router          # show ladders, advance order, and discovered google-keyN providers
+/gemini-router reset    # restart at the ladder head on key1 (post-quota-reset)
 ```
 
 Router state lives on the session branch, so it survives compaction and resumes;
@@ -90,9 +123,11 @@ Symlinked into `~/.pi/agent/extensions/pi-gemini-router` like the other pi
 extensions. Requires the `google` accounts in
 `~/.pi/agent/multi-account.json` (the `pi-multi-account` extension).
 
-## Typecheck
+## Typecheck & smoke
 
 ```bash
-cd ~/projects/pi-gemini-router && ./node_modules/.bin/tsc --noEmit
-cd ~/projects/pi-gemini-router && bun signal.test.ts
+cd ~/Projects/pi-gemini-router && ./node_modules/.bin/tsc --noEmit
+scripts/smoke.sh                # routing ladder, rotation, rotatable errors
+scripts/smoke.sh model-first    # config override case (order + custom ladder)
+cd ~/Projects/pi-gemini-router && bun signal.test.ts
 ```

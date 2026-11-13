@@ -3,8 +3,8 @@
  *
  * Registers two virtual models on the `google` provider:
  *
- *   google/gemini-flash       ladder: gemini-flash-latest -> 3.8 -> 3.7 -> 3.6
- *                                  -> 3.5 -> 3-flash-preview
+ *   google/gemini-flash       ladder: gemini-4-hydrogen -> gemini-flash-latest
+ *                                  -> 3.8 -> 3.7 -> 3.6 -> 3.5 -> 3-flash-preview
  *   google/gemini-flash-lite  ladder: gemini-flash-lite-latest -> 3.5-flash-lite
  *                                  -> 3.1-flash-lite
  *
@@ -17,15 +17,28 @@
  * Why: AI Studio free-tier quotas are per model AND per project. Gemini Flash
  * models get 20 RPD each and Flash Lite 500 RPD each, so a model ladder plus
  * key rotation multiplies daily capacity without touching per-request limits.
- * `-latest` aliases share the concrete model's quota, which is why they sit at
- * the head of the ladder (tried first) rather than counting as extra buckets.
+ * `-latest` aliases share the concrete model's quota, which is why they sit
+ * near the head of the ladder (tried early) rather than counting as extra
+ * buckets.
  *
  * `/gemini-router` shows the ladders and discovered keys; `/gemini-router reset`
- * bumps an epoch so the next request starts at gemini-flash-latest on key1
+ * bumps an epoch so the next request starts at the ladder head on key1
  * (useful after the daily quota resets).
  *
+ * Both ladders and the advance order (key-first vs model-first) are
+ * configurable in `~/.pi/agent/gemini-router.json`.
+ *
  * The provider patch below also keeps the Google adapter alive across two
- * abort-signal hazards (see restoreAbortSignal and sanitizeSignal).
+ * abort-signal hazards (see restoreAbortSignal and sanitizeSignal) and
+ * neutralizes a third: pi-ai only replays `thoughtSignature`s when the
+ * history comes from the exact same provider+model, so every model switch
+ * leaves `functionCall` parts unsigned and strict Gemini 3/4 models answer
+ * 400 "Function call is missing a thought_signature". Google special-cases
+ * the sentinel value `skip_thought_signature_validator` for exactly this
+ * (verified: it bypasses the base64 TYPE_BYTES check that rejects any other
+ * non-base64 value, and is accepted by 3.5-flash/4-hydrogen), so unsigned
+ * function calls get it injected before the request is sent
+ * (see injectThoughtSignatures).
  *
  * Startup cost is kept near zero: only the built-in `google` provider is
  * patched eagerly; `google-keyN` providers are patched once they appear in
@@ -40,12 +53,16 @@ import type { ExtensionAPI, ExtensionContext, ExtensionVirtualModel } from "@ear
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { sanitizeSignal } from "./signal.ts";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const PROVIDER = "google";
 const KEY_PROVIDER_PATTERN = /^google-key(\d+)$/;
 
-/** Ladder order: newest first. `-latest` aliases head the ladder. */
-const FLASH_LADDER = [
+/** Default ladder order: newest first. `-latest` aliases sit right behind the newest concrete model. */
+const DEFAULT_FLASH_LADDER = [
+  "gemini-4-hydrogen",
   "gemini-flash-latest",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
@@ -54,7 +71,7 @@ const FLASH_LADDER = [
   "gemini-3-flash-preview",
 ];
 
-const FLASH_LITE_LADDER = [
+const DEFAULT_FLASH_LITE_LADDER = [
   "gemini-flash-lite-latest",
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
@@ -62,6 +79,39 @@ const FLASH_LITE_LADDER = [
 
 const FLASH_CONTEXT_WINDOW = 1048576;
 const FLASH_MAX_TOKENS = 65536;
+
+/** User overrides for the ladders and the advance order. */
+interface RouterConfig {
+  ladders?: Partial<Record<"gemini-flash" | "gemini-flash-lite", string[]>>;
+  /** `key-first` (default): exhaust all keys on one model, then the next model. `model-first`: walk the ladder per key. */
+  order?: "key-first" | "model-first";
+}
+
+const CONFIG_PATH = join(homedir(), ".pi", "agent", "gemini-router.json");
+
+let routerConfig: RouterConfig = {};
+
+function loadConfig(): void {
+  try {
+    routerConfig = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as RouterConfig;
+  } catch {
+    routerConfig = {};
+  }
+}
+
+function flashLadder(): string[] {
+  const fromConfig = routerConfig.ladders?.["gemini-flash"];
+  return fromConfig && fromConfig.length > 0 ? fromConfig : DEFAULT_FLASH_LADDER;
+}
+
+function flashLiteLadder(): string[] {
+  const fromConfig = routerConfig.ladders?.["gemini-flash-lite"];
+  return fromConfig && fromConfig.length > 0 ? fromConfig : DEFAULT_FLASH_LITE_LADDER;
+}
+
+function advanceOrder(): "key-first" | "model-first" {
+  return routerConfig.order === "model-first" ? "model-first" : "key-first";
+}
 
 interface RouterState {
   /** Index into the ladder. */
@@ -195,12 +245,60 @@ function restoreAbortSignal<T>(payload: T, signal: unknown): T {
 type AdapterMethod = "stream" | "streamSimple";
 
 /**
+ * Google's escape hatch for replayed tool calls: a `thoughtSignature` with
+ * this exact value skips signature validation. Needed because pi-ai drops
+ * signatures on provider/model mismatch (resolveThoughtSignature), so a
+ * router model switch leaves every prior `functionCall` part unsigned and
+ * strict Gemini 3/4 models reject the request with
+ * `Function call is missing a thought_signature` (400). Verified live: any
+ * other non-base64 value dies in the TYPE_BYTES base64 check before this
+ * special case, and the sentinel is accepted by 3.5-flash and 4-hydrogen.
+ */
+const THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
+
+/** Gemini major version, or undefined for non-gemini ids (gemma, claude-behind-google, …). */
+function geminiMajorVersion(modelId: string): number | undefined {
+  const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
+  return match ? Number.parseInt(match[1], 10) : undefined;
+}
+
+/**
+ * Fill every unsigned `functionCall` part in the outgoing payload with the
+ * sentinel. Only strict Gemini 3+ models need it; other models (gemma, …)
+ * keep their payload untouched. Mutates in place and is idempotent.
+ */
+function injectThoughtSignatures(payload: unknown, model: unknown): void {
+  const id = (model as { id?: unknown } | undefined)?.id;
+  if (typeof id !== "string") return;
+  const major = geminiMajorVersion(id);
+  if (major === undefined || major < 3) return;
+  const contents = (payload as { contents?: unknown } | undefined)?.contents;
+  if (!Array.isArray(contents)) return;
+  for (const content of contents) {
+    const parts = (content as { parts?: unknown } | undefined)?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      if (
+        part &&
+        typeof part === "object" &&
+        "functionCall" in part &&
+        !(part as { thoughtSignature?: unknown }).thoughtSignature
+      ) {
+        (part as { thoughtSignature?: string }).thoughtSignature = THOUGHT_SIGNATURE_SENTINEL;
+      }
+    }
+  }
+}
+
+/**
  * Call the Google adapter with a survivable options object:
  *
  * 1. `sanitizeSignal` drops duck-typed turn signals (truthy, `.aborted`, no
  *    `addEventListener`) before they reach the genai client.
- * 2. `onPayload` is wrapped so a payload rebuilt by `before_provider_request`
- *    handlers cannot ship a degraded `{}` abort signal to the SDK.
+ * 2. `onPayload` is always installed: it injects sentinel thought signatures
+ *    (injectThoughtSignatures), then chains the incoming handler so a payload
+ *    rebuilt by `before_provider_request` handlers cannot ship a degraded
+ *    `{}` abort signal (restoreAbortSignal) or lose the signatures.
  */
 function callGoogleAdapter(
   method: AdapterMethod,
@@ -211,13 +309,16 @@ function callGoogleAdapter(
   const clean = sanitizeSignal(options);
   const signal = clean?.signal;
   const origOnPayload = clean?.onPayload;
-  const callOptions: SimpleStreamOptions | undefined = origOnPayload
-    ? ({
-        ...clean,
-        onPayload: async (payload: unknown, m) =>
-          restoreAbortSignal((await origOnPayload(payload, m as never)) ?? payload, signal),
-      } as SimpleStreamOptions)
-    : clean;
+  const callOptions: SimpleStreamOptions = {
+    ...clean,
+    onPayload: async (payload: unknown, m) => {
+      injectThoughtSignatures(payload, m);
+      const replaced = origOnPayload ? await origOnPayload(payload, m as never) : undefined;
+      const final = restoreAbortSignal((replaced ?? payload) as never, signal);
+      injectThoughtSignatures(final, m);
+      return final;
+    },
+  } as SimpleStreamOptions;
   const versioned = versionedModel(model);
   const streams = getStreams();
   return method === "stream"
@@ -284,61 +385,93 @@ function ladderLabel(ladder: string[]): string {
 const ROTATABLE_ERROR_PATTERN =
   /429|RESOURCE_EXHAUSTED|quota|rate.?limit|too many requests|high demand|UNAVAILABLE|503|500|502|504|overloaded/i;
 
+/**
+ * Pair-specific rejections: a 400/404 usually means the (model, key) pair
+ * cannot serve this conversation — model unavailable for the project, strict
+ * Gemini 3/4 signature enforcement (`Function call is missing a
+ * thought_signature`), or a retired model id. Without rotating, the walk
+ * would stick on that pair forever (pi never retries a 400). Context-overflow
+ * 400s are the exception: no pair can serve them (they are the request's
+ * size, not the pair's), so they are left to pi's compaction instead of
+ * burning the whole ladder.
+ */
+const PAIR_SPECIFIC_ERROR_PATTERN =
+  /\b400\b|INVALID_ARGUMENT|NOT_FOUND|FAILED_PRECONDITION|thought_signature|not found|not supported/i;
+const NON_ROTATABLE_ERROR_PATTERN =
+  /exceeds the maximum|token limit|input token|context length|request too large|payload too large|too many tokens/i;
+
 /** Whether the failure is worth trying another key (and then model) for. */
-function isRotatableError(errorMessage: string): boolean {
+export function isRotatableError(errorMessage: string): boolean {
   if (!errorMessage) return false;
   // A bad key is a permanent per-key problem: rotating the key is exactly the
   // right response, so it is rotatable too.
   if (/API[_ ]KEY[_ ]INVALID|API key not valid|PERMISSION_DENIED|401|403/i.test(errorMessage)) {
     return true;
   }
-  return ROTATABLE_ERROR_PATTERN.test(errorMessage);
+  if (NON_ROTATABLE_ERROR_PATTERN.test(errorMessage)) {
+    return false;
+  }
+  return ROTATABLE_ERROR_PATTERN.test(errorMessage) || PAIR_SPECIFIC_ERROR_PATTERN.test(errorMessage);
 }
 
-/** Advance the (model, key) pair by one step: key first, then model. */
-function advanceState(state: RouterState, ladderLength: number, keyCount: number): RouterState {
+/** Advance the (model, key) pair by one step.
+ *
+ * `key-first`: key index fastest, model index slowest — exhaust all keys on
+ * one model before moving down the ladder. `model-first`: walk the ladder on
+ * one key, then move to the next key.
+ */
+function advanceState(
+  state: RouterState,
+  ladderLength: number,
+  keyCount: number,
+  order: "key-first" | "model-first"
+): RouterState {
   const total = Math.max(1, ladderLength * keyCount);
-  const from = state.m * keyCount + state.k;
+  const from =
+    order === "model-first"
+      ? state.k * ladderLength + state.m
+      : state.m * keyCount + state.k;
   const next = (from + 1) % total;
   return {
-    m: Math.floor(next / keyCount) % ladderLength,
-    k: next % keyCount,
+    m: order === "model-first" ? next % ladderLength : Math.floor(next / keyCount) % ladderLength,
+    k: order === "model-first" ? Math.floor(next / ladderLength) % keyCount : next % keyCount,
     epoch,
     tried: (state.tried ?? 0) + 1,
   };
 }
 
-/**
- * Advance order: key index fastest, model index slowest — exhaust all keys on
- * one model before moving down the ladder. Missing (model, key) pairs (a
- * provider without that catalog entry) are skipped.
- */
-function makeRouter(ladder: string[]): RouteFn {
+/** Missing (model, key) pairs (a provider without that catalog entry) are skipped. */
+function makeRouter(ladderOf: () => string[]): RouteFn {
   return function route(request, ctx) {
     let state: RouterState =
       request.state && request.state.epoch === epoch
         ? request.state
         : { m: 0, k: 0, epoch };
     const keys = keyProviders(ctx);
-    const keyCount = Math.max(1, keys.length);
-
-    // Only a failed request moves the pair; success, user messages and
-    // continuations keep the current (model, key).
-    if (request.reason === "retry" && request.failed) {
-      state = advanceState(state, ladder.length, keyCount);
-    }
-
     if (keys.length === 0) {
       throw new Error(
         "gemini-router: no google-keyN providers found — is pi-multi-account configured with google accounts?"
       );
     }
+    const keyCount = Math.max(1, keys.length);
+    const ladder = ladderOf();
+    const order = advanceOrder();
+
+    // Only a failed request moves the pair; success, user messages and
+    // continuations keep the current (model, key).
+    if (request.reason === "retry" && request.failed) {
+      state = advanceState(state, ladder.length, keyCount, order);
+    }
+
     const total = ladder.length * keys.length;
-    const from = state.m * keys.length + state.k;
+    const from =
+      order === "model-first"
+        ? state.k * ladder.length + state.m
+        : state.m * keys.length + state.k;
     for (let step = 0; step < total; step++) {
       const idx = (from + step) % total;
-      const m = Math.floor(idx / keys.length) % ladder.length;
-      const k = idx % keys.length;
+      const m = order === "model-first" ? idx % ladder.length : Math.floor(idx / keys.length) % ladder.length;
+      const k = order === "model-first" ? Math.floor(idx / ladder.length) % keys.length : idx % keys.length;
       const model = ctx.modelRegistry.find(keys[k], ladder[m]);
       if (model) {
         return { model, thinkingLevel: request.thinkingLevel, state: { m, k, epoch } };
@@ -353,7 +486,7 @@ function makeRouter(ladder: string[]): RouteFn {
 function virtualModel(
   id: string,
   name: string,
-  ladder: string[]
+  ladderOf: () => string[]
 ): ExtensionVirtualModel<RouterState> {
   const def: ExtensionVirtualModel<RouterState> = {
     provider: PROVIDER,
@@ -363,7 +496,7 @@ function virtualModel(
     contextWindow: FLASH_CONTEXT_WINDOW,
     maxTokens: FLASH_MAX_TOKENS,
     input: ["text", "image"],
-    route: makeRouter(ladder),
+    route: makeRouter(ladderOf),
   };
   return def;
 }
@@ -374,12 +507,12 @@ interface SelectedRouter {
   ladder: string[];
 }
 
-/** The ladder of the selected virtual model, if it is one of ours. */
+/** The live ladder of the selected virtual model, if it is one of ours. */
 function selectedRouter(ctx: ExtensionContext): SelectedRouter | undefined {
   const model = ctx.model;
   if (!model || model.provider !== PROVIDER) return undefined;
-  if (model.id === "gemini-flash") return { modelId: model.id, ladder: FLASH_LADDER };
-  if (model.id === "gemini-flash-lite") return { modelId: model.id, ladder: FLASH_LITE_LADDER };
+  if (model.id === "gemini-flash") return { modelId: model.id, ladder: flashLadder() };
+  if (model.id === "gemini-flash-lite") return { modelId: model.id, ladder: flashLiteLadder() };
   return undefined;
 }
 
@@ -434,24 +567,28 @@ function patchGoogleProvider(pi: ExtensionAPI, providerId: string): void {
 }
 
 export default function (pi: ExtensionAPI): void {
+  loadConfig();
+
   // The compat module (and its ~100ms module graph) loads in the background;
   // it also registers the patched adapter in pi-ai's api-provider registry so
   // compat-dispatched calls get the same fixes. registerBuiltInApiProviders()
   // does not clobber existing entries.
   preloadCompat();
 
-  // Only patch paid at startup: the built-in google provider. Each
+  // Only patch at startup: the built-in google provider. Each
   // registerProvider triggers pi's model snapshot rebuild, so google-keyN
   // providers are patched when they actually appear in the registry instead
   // of being created eagerly as empty providers.
   patchGoogleProvider(pi, "google");
 
-  pi.registerVirtualModel(virtualModel("gemini-flash", "Gemini Flash (router)", FLASH_LADDER));
-  pi.registerVirtualModel(virtualModel("gemini-flash-lite", "Gemini Flash Lite (router)", FLASH_LITE_LADDER));
+  pi.registerVirtualModel(virtualModel("gemini-flash", "Gemini Flash (router)", flashLadder));
+  pi.registerVirtualModel(virtualModel("gemini-flash-lite", "Gemini Flash Lite (router)", flashLiteLadder));
 
   // By now pi-multi-account has registered google-key1; patch every
-  // Google-ish provider that has models in the registry.
+  // Google-ish provider that has models in the registry, and pick up config
+  // edits without a restart.
   pi.on("session_start", ((_event: unknown, ctx: ExtensionContext) => {
+    loadConfig();
     const providers = new Set<string>([PROVIDER]);
     for (const m of ctx.modelRegistry.getAll()) {
       if (KEY_PROVIDER_PATTERN.test(m.provider) || m.provider === PROVIDER) providers.add(m.provider);
@@ -541,7 +678,7 @@ export default function (pi: ExtensionAPI): void {
     if (failure.tried >= totalPairs) return undefined;
 
     const current = failure.state ?? { m: 0, k: 0, epoch };
-    const next = advanceState(current, router.ladder.length, keyCount);
+    const next = advanceState(current, router.ladder.length, keyCount, advanceOrder());
 
     // The failed attempt must leave the context, or the retry repeats it.
     const targetPresent = event.context.contextEntries.some(
@@ -578,19 +715,21 @@ export default function (pi: ExtensionAPI): void {
       if (cmd === "reset") {
         epoch += 1;
         ctx.ui.notify(
-          "gemini-router: reset — next request starts at gemini-flash-latest on key1",
+          "gemini-router: reset — next request starts at the ladder head on key1",
           "info"
         );
         return;
       }
       const keys = keyProviders(ctx);
+      const flashFromConfig = routerConfig.ladders?.["gemini-flash"];
+      const liteFromConfig = routerConfig.ladders?.["gemini-flash-lite"];
       const lines = [
-        "gemini-router ladders:",
-        "  gemini-flash       " + ladderLabel(FLASH_LADDER),
-        "  gemini-flash-lite  " + ladderLabel(FLASH_LITE_LADDER),
+        "gemini-router ladders" + (flashFromConfig || liteFromConfig ? " (config: " + CONFIG_PATH + ")" : " (defaults; override in " + CONFIG_PATH + "):"),
+        "  gemini-flash       " + ladderLabel(flashLadder()) + (flashFromConfig ? "  [config]" : ""),
+        "  gemini-flash-lite  " + ladderLabel(flashLiteLadder()) + (liteFromConfig ? "  [config]" : ""),
         "keys discovered: " + (keys.length ? keys.join(", ") : "none — configure google accounts in multi-account.json"),
-        "advance: key first (all keys on one model), then next model; holds (model, key) until it errors",
-        "/gemini-router reset — restart at latest flash on key1",
+        "advance: " + advanceOrder() + " (" + (advanceOrder() === "key-first" ? "all keys on one model, then next model" : "whole ladder per key, then next key") + "); holds (model, key) until it errors",
+        "/gemini-router reset — restart at the ladder head on key1",
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },

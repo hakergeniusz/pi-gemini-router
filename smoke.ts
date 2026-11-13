@@ -1,6 +1,11 @@
 // Smoke test for pi-gemini-router: stubs the registry and exercises the
 // ladder/rotation logic without touching the network.
-import activate from "./index.ts";
+//
+// Run with node's type stripping and pi's node_modules on the resolution path
+// (see scripts/smoke.sh). GEMINI_ROUTER_SMOKE=model-first runs the
+// config-override case (expects a seeded ~/.pi/agent/gemini-router.json with
+// order "model-first" and a two-model flash ladder).
+import activate, { isRotatableError } from "./index.ts";
 
 const virtualModels = new Map<string, { provider: string; id: string; route: (r: unknown, c: unknown) => unknown }>();
 const commands: string[] = [];
@@ -11,6 +16,7 @@ const pi = {
     virtualModels.set(def.provider + "/" + def.id, def as never);
   },
   registerCommand: (name: string) => commands.push(name),
+  on: () => {},
 } as never;
 
 activate(pi);
@@ -20,6 +26,7 @@ if (commands.join(",") !== "gemini-router") throw new Error("command not registe
 
 // Stub registry: 7 google-keyN providers, each with the full flash ladders.
 const FLASH = [
+  "gemini-4-hydrogen",
   "gemini-flash-latest",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
@@ -48,56 +55,81 @@ function route(model: typeof flash, request: Record<string, unknown>) {
   return model.route(request, ctx) as { model: { provider: string; id: string }; state: { m: number; k: number } };
 }
 
-// 1. First request: latest flash on key1.
-let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
-assertEq(r.model.provider + "/" + r.model.id, "google-key1/gemini-flash-latest", "first pick");
-const s0 = r.state;
+if (process.env.GEMINI_ROUTER_SMOKE === "model-first") {
+  // Config case: order model-first, ladder [3.5-flash, 3.8-flash] (from the
+  // seeded config). The ladder advances before the key.
+  let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key1/gemini-3.5-flash", "config first pick");
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: {} });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key1/gemini-3.8-flash", "model-first advances the model first");
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: r.state, failed: {} });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key2/gemini-3.5-flash", "model-first wraps to the next key");
+  console.log("OK — model-first config order and custom ladder honored");
+} else {
+  // 1. First request: hydrogen (ladder head) on key1.
+  let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(r.model.provider + "/" + r.model.id, "google-key1/gemini-4-hydrogen", "first pick");
+  const s0 = r.state;
 
-// 2. Retry after failure: same model, next key.
-r = route(flash, { reason: "retry", thinkingLevel: "off", state: s0, failed: { model: r.model } });
-assertEq(r.model.provider, "google-key2", "key advances on retry, model holds");
-assertEq(r.model.id, "gemini-flash-latest", "model holds across keys");
+  // 2. Retry after failure: same model, next key.
+  r = route(flash, { reason: "retry", thinkingLevel: "off", state: s0, failed: { model: r.model } });
+  assertEq(r.model.provider, "google-key2", "key advances on retry, model holds");
+  assertEq(r.model.id, "gemini-4-hydrogen", "model holds across keys");
 
-// 3. User message with same state: no movement.
-r = route(flash, { reason: "user", thinkingLevel: "off", state: r.state });
-assertEq(r.model.provider, "google-key2", "no advance on success/user");
+  // 3. User message with same state: no movement.
+  r = route(flash, { reason: "user", thinkingLevel: "off", state: r.state });
+  assertEq(r.model.provider, "google-key2", "no advance on success/user");
 
-// 4. Continuation: no movement.
-r = route(flash, { reason: "continuation", thinkingLevel: "off", state: r.state });
-assertEq(r.model.provider, "google-key2", "no advance on continuation");
+  // 4. Continuation: no movement.
+  r = route(flash, { reason: "continuation", thinkingLevel: "off", state: r.state });
+  assertEq(r.model.provider, "google-key2", "no advance on continuation");
 
-// 5. Exhaust all 7 keys on gemini-flash-latest; the next failure moves the model.
-let state = r.state;
-for (let i = 0; i < 4; i++) {
-  state = route(flash, { reason: "retry", thinkingLevel: "off", state, failed: {} }).state;
+  // 5. Exhaust all 7 keys on gemini-4-hydrogen; the next failure moves the model.
+  let state = r.state;
+  for (let i = 0; i < 4; i++) {
+    state = route(flash, { reason: "retry", thinkingLevel: "off", state, failed: {} }).state;
+  }
+  const lastKeyOnHead = route(flash, { reason: "retry", thinkingLevel: "off", state, failed: {} });
+  assertEq(lastKeyOnHead.model.provider, "google-key7", "last key on the model");
+  const nextModel = route(flash, { reason: "retry", thinkingLevel: "off", state: lastKeyOnHead.state, failed: {} });
+  assertEq(nextModel.model.provider, "google-key1", "model change restarts on key1");
+  assertEq(nextModel.model.id, "gemini-flash-latest", "model advances only after all keys failed");
+
+  // 6. Flash-lite router: same model across all keys, then next lite model.
+  let lr = route(lite, { reason: "user", thinkingLevel: "off", state: undefined });
+  assertEq(lr.model.id, "gemini-flash-lite-latest", "lite first pick");
+  let lstate = lr.state;
+  for (let i = 0; i < 6; i++) {
+    lstate = route(lite, { reason: "retry", thinkingLevel: "off", state: lstate, failed: {} }).state;
+  }
+  assertEq(lstate.k, 6, "all 7 keys tried on flash-lite-latest");
+  assertEq(lstate.m, 0, "lite model holds across keys");
+  lr = route(lite, { reason: "retry", thinkingLevel: "off", state: lstate, failed: {} });
+  assertEq(lr.model.provider, "google-key1", "lite model change restarts on key1");
+  assertEq(lr.model.id, "gemini-3.5-flash-lite", "lite advances to next model after all keys");
+
+  // 7. Missing models are skipped: key3 lacks flash-lite entries entirely.
+  ALL.delete("google-key3/gemini-flash-lite-latest");
+  ALL.delete("google-key3/gemini-3.5-flash-lite");
+  ALL.delete("google-key3/gemini-3.1-flash-lite");
+  const withHole = route(lite, { reason: "retry", thinkingLevel: "off", state: { m: 0, k: 2, epoch: 0 }, failed: {} });
+  assertEq(withHole.model.provider + "/" + withHole.model.id, "google-key4/gemini-flash-lite-latest", "skips key without the model");
+
+  // 8. Rotatable errors: quota and 4xx pair rejections rotate; context-overflow does not.
+  const overflow = "Request contains an input that exceeds the maximum context length";
+  assert(isRotatableError("429 RESOURCE_EXHAUSTED quota"), "quota rotates");
+  assert(isRotatableError("400 Function call is missing a thought_signature in functionCall parts"), "signature 400 rotates");
+  assert(isRotatableError("models/gemini-4-hydrogen is not found for API version v1beta"), "404 rotates");
+  assert(isRotatableError("API key not valid"), "bad key rotates");
+  assert(!isRotatableError(overflow), "context overflow does not rotate");
+  assert(!isRotatableError(""), "empty does not rotate");
+
+  console.log("OK — hydrogen-first ladder, key rotation, hold-on-success, model-skip, and rotatable-error classes all pass");
 }
-const lastKeyOnLatest = route(flash, { reason: "retry", thinkingLevel: "off", state, failed: {} });
-assertEq(lastKeyOnLatest.model.provider, "google-key7", "last key on the model");
-const nextModel = route(flash, { reason: "retry", thinkingLevel: "off", state: lastKeyOnLatest.state, failed: {} });
-assertEq(nextModel.model.provider, "google-key1", "model change restarts on key1");
-assertEq(nextModel.model.id, "gemini-3.8-flash", "model advances only after all keys failed");
 
-// 6. Flash-lite router: same model across all keys, then next lite model.
-let lr = route(lite, { reason: "user", thinkingLevel: "off", state: undefined });
-assertEq(lr.model.id, "gemini-flash-lite-latest", "lite first pick");
-let lstate = lr.state;
-for (let i = 0; i < 6; i++) {
-  lstate = route(lite, { reason: "retry", thinkingLevel: "off", state: lstate, failed: {} }).state;
+function assert(cond: unknown, what: string): void {
+  if (!cond) throw new Error(what + ": failed");
 }
-assertEq(lstate.k, 6, "all 7 keys tried on flash-lite-latest");
-assertEq(lstate.m, 0, "lite model holds across keys");
-lr = route(lite, { reason: "retry", thinkingLevel: "off", state: lstate, failed: {} });
-assertEq(lr.model.provider, "google-key1", "lite model change restarts on key1");
-assertEq(lr.model.id, "gemini-3.5-flash-lite", "lite advances to next model after all keys");
-
-// 7. Missing models are skipped: key3 lacks flash-lite entries entirely.
-ALL.delete("google-key3/gemini-flash-lite-latest");
-ALL.delete("google-key3/gemini-3.5-flash-lite");
-ALL.delete("google-key3/gemini-3.1-flash-lite");
-const withHole = route(lite, { reason: "retry", thinkingLevel: "off", state: { m: 0, k: 2, epoch: 0 }, failed: {} });
-assertEq(withHole.model.provider + "/" + withHole.model.id, "google-key4/gemini-flash-lite-latest", "skips key without the model");
-
-console.log("OK — routing ladder, key rotation, hold-on-success, and model-skip all pass");
 
 function assertEq(actual: unknown, expected: unknown, what: string) {
   if (actual !== expected) {
