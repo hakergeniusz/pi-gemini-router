@@ -80,6 +80,34 @@ drops the failed attempt from the context, and asks for one more request. The
 walk stops once every pair has been tried. Context-overflow 400s do **not**
 rotate: no pair can serve them, so they are left to pi's compaction.
 
+## The xhigh thinking level
+
+`xhigh` exists officially but only on the **v1alpha** endpoint: v1beta's
+`ThinkingLevel` proto enum rejects `"XHIGH"` with `INVALID_ARGUMENT` (verified
+live on gemini-4-hydrogen), while v1alpha accepts it. Two more blockers live in
+pi-ai: its Google resolver whitelists `minimal/low/medium/high`, and the
+catalogs map `xhigh` either to `null` (hidden from the level cycle) or to the
+identity `"xhigh"` (which is exactly what the resolver throws on).
+
+The router handles all of it: the virtual models offer `xhigh` in their level
+cycle, and the wrapped adapter intercepts `reasoning: "xhigh"` requests — it
+streams through a model clone whose `thinkingLevelMap` resolves `xhigh` to
+`high` (no throw), points at `generativelanguage.googleapis.com/v1alpha`, and
+the `onPayload` chain restores the real `XHIGH` level on the wire. Physical
+`google-keyN` models get the same treatment because the patch wraps every
+Google provider; for the TUI to offer `xhigh` on them, their catalog entry
+must map `xhigh` to a non-null, resolver-legal value (`"high"` in
+`~/.pi/agent/models.json`).
+
+## Context window
+
+The virtual models advertise **250 000** context tokens, not the model's
+nominal 1M: free-tier TPM is 250K per project/model
+(`GenerateContentInputTokensPerMinutePerProjectPerModel`), so a request past
+that always 429s. Advertising 250K makes pi compact long sessions before they
+hit that wall. Physical flash/flash-lite-tier entries in
+`multi-account.json`/`models.json` carry the same cap.
+
 ## The thought-signature fix
 
 pi-ai only replays `thoughtSignature`s when the history comes from the exact

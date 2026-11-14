@@ -1,9 +1,9 @@
 #!/bin/zsh
 # Runs smoke.ts with node's type stripping and pi's node_modules on the
 # resolution path. argv[1] selects the case: "model-first" (config override),
-# "quota" (quota awareness), or default (ladder/rotation defaults). HOME is
-# redirected to a temp dir for every case so config/quota files never touch
-# the real ~/.pi/agent.
+# "quota" (quota awareness), "xhigh" (xhigh wire rewrite), or default
+# (ladder/rotation defaults). HOME is redirected to a temp dir for every case
+# so config/quota files never touch the real ~/.pi/agent.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -26,6 +26,9 @@ JSON
     node --experimental-strip-types "$SMOKE_DIR/smoke.ts"
 elif [[ "$1" == "quota" ]]; then
   HOME="$SMOKE_DIR/home" GEMINI_ROUTER_SMOKE=quota \
+    node --experimental-strip-types "$SMOKE_DIR/smoke.ts"
+elif [[ "$1" == "xhigh" ]]; then
+  HOME="$SMOKE_DIR/home" GEMINI_ROUTER_SMOKE=xhigh \
     node --experimental-strip-types "$SMOKE_DIR/smoke.ts"
 else
   HOME="$SMOKE_DIR/home" node --experimental-strip-types "$SMOKE_DIR/smoke.ts"

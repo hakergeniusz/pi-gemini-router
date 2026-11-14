@@ -77,7 +77,10 @@ const DEFAULT_FLASH_LITE_LADDER = [
   "gemini-3.1-flash-lite",
 ];
 
-const FLASH_CONTEXT_WINDOW = 1048576;
+// Free-tier TPM is 250K per project/model — a request past that always 429s
+// (GenerateContentInputTokensPerMinutePerProjectPerModel). Advertise 250K so
+// pi compacts long sessions before they hit that wall.
+const FLASH_CONTEXT_WINDOW = 250000;
 const FLASH_MAX_TOKENS = 65536;
 
 /** User overrides for the ladders and the advance order. */
@@ -305,6 +308,14 @@ let lastFailure: RouterFailure | undefined;
 let epoch = 0;
 
 const GOOGLE_API = "google-generative-ai" as const;
+/**
+ * xhigh exists officially only on the v1alpha endpoint: v1beta's ThinkingLevel
+ * proto enum rejects "XHIGH" with INVALID_ARGUMENT (verified live on
+ * gemini-4-hydrogen), while v1alpha accepts it.
+ */
+const GOOGLE_V1ALPHA_BASE_URL = "https://generativelanguage.googleapis.com/v1alpha";
+/** Model clones carrying this marker get their thinking level rewritten on the wire. */
+const XHIGH_WIRE_MARKER = "__routerXhighWire";
 
 /** The Google adapter, reached through the compat entrypoint.
  *
@@ -455,6 +466,31 @@ function injectThoughtSignatures(payload: unknown, model: unknown): void {
  *    rebuilt by `before_provider_request` handlers cannot ship a degraded
  *    `{}` abort signal (restoreAbortSignal) or lose the signatures.
  */
+/**
+ * pi-ai's Google resolver whitelists minimal/low/medium/high, so a raw "xhigh"
+ * request throws before any payload exists (and the catalogs' identity
+ * xhigh->xhigh mapping is exactly what trips it). Hand pi-ai a clone whose map
+ * resolves xhigh to "high" (no throw), pointed at v1alpha, and marked — the
+ * payload chain below restores the real XHIGH level on the wire.
+ */
+/** Exported for smoke tests. */
+export function xhighModel(model: Model<Api>): Model<Api> {
+	return {
+		...model,
+		thinkingLevelMap: { ...(model.thinkingLevelMap ?? {}), xhigh: "high" },
+		baseUrl: GOOGLE_V1ALPHA_BASE_URL,
+		[XHIGH_WIRE_MARKER]: true,
+	} as Model<Api>;
+}
+
+/** Restore the requested xhigh level after pi-ai resolved it down to "high". */
+export function restoreXhighWire(payload: unknown): void {
+	const p = payload as { config?: { thinkingConfig?: { thinkingLevel?: string } } };
+	if (p?.config?.thinkingConfig?.thinkingLevel === "HIGH") {
+		p.config.thinkingConfig.thinkingLevel = "XHIGH";
+	}
+}
+
 function callGoogleAdapter(
   method: AdapterMethod,
   model: Model<Api>,
@@ -464,17 +500,21 @@ function callGoogleAdapter(
   const clean = sanitizeSignal(options);
   const signal = clean?.signal;
   const origOnPayload = clean?.onPayload;
+  const wantXhigh = model.reasoning === true && clean?.reasoning === "xhigh";
+  const target = wantXhigh ? xhighModel(model) : model;
   const callOptions: SimpleStreamOptions = {
     ...clean,
     onPayload: async (payload: unknown, m) => {
       injectThoughtSignatures(payload, m);
+      if (wantXhigh) restoreXhighWire(payload);
       const replaced = origOnPayload ? await origOnPayload(payload, m as never) : undefined;
       const final = restoreAbortSignal((replaced ?? payload) as never, signal);
       injectThoughtSignatures(final, m);
+      if (wantXhigh) restoreXhighWire(final);
       return final;
     },
   } as SimpleStreamOptions;
-  const versioned = versionedModel(model);
+  const versioned = versionedModel(target);
   const streams = getStreams();
   return method === "stream"
     ? streams.stream(versioned as Model<typeof GOOGLE_API>, context, callOptions as never)
@@ -670,7 +710,7 @@ function virtualModel(
     provider: PROVIDER,
     id,
     name,
-    thinkingLevels: ["off", "low", "medium", "high"],
+    thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
     contextWindow: FLASH_CONTEXT_WINDOW,
     maxTokens: FLASH_MAX_TOKENS,
     input: ["text", "image"],

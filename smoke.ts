@@ -7,7 +7,7 @@
 //   quota       — quota awareness: marking, skipping, self-healing, fallback
 // HOME is redirected by smoke.sh for every case, so config/quota files never
 // touch the real ~/.pi/agent.
-import activate, { isRotatableError } from "./index.ts";
+import activate, { isRotatableError, restoreXhighWire, xhighModel } from "./index.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -64,7 +64,33 @@ function route(model: typeof flash, request: Record<string, unknown>) {
   return model.route(request, ctx) as { model: { provider: string; id: string }; state: { m: number; k: number } };
 }
 
-if (process.env.GEMINI_ROUTER_SMOKE === "model-first") {
+if (process.env.GEMINI_ROUTER_SMOKE === "xhigh") {
+	// xhigh support: the virtual model offers xhigh, the clone points at
+	// v1alpha with a resolver-legal map, and the wire rewrite restores XHIGH.
+	const levels = (flash as unknown as { thinkingLevels: string[] }).thinkingLevels;
+	assert(levels.includes("xhigh"), "virtual flash model offers xhigh");
+	const liteLevels = (lite as unknown as { thinkingLevels: string[] }).thinkingLevels;
+	assert(liteLevels.includes("xhigh"), "virtual flash-lite model offers xhigh");
+
+	const hydrogen = { provider: "google-key1", id: "gemini-4-hydrogen", reasoning: true, thinkingLevelMap: { off: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" } };
+	const clone = xhighModel(hydrogen as never) as Record<string, unknown>;
+	assertEq(clone.baseUrl, "https://generativelanguage.googleapis.com/v1alpha", "clone routes to v1alpha");
+	assertEq((clone.thinkingLevelMap as Record<string, unknown>).xhigh, "high", "clone resolves xhigh legally");
+	assertEq(clone.id, "gemini-4-hydrogen", "clone keeps the model id");
+	assertEq((clone.thinkingLevelMap as Record<string, unknown>).high, "high", "clone keeps other mappings");
+	assertEq((hydrogen as Record<string, unknown>).baseUrl, undefined, "original model untouched");
+
+	const payload = { config: { thinkingConfig: { thinkingLevel: "HIGH" } } };
+	restoreXhighWire(payload);
+	assertEq(payload.config.thinkingConfig.thinkingLevel, "XHIGH", "wire level restored to XHIGH");
+	restoreXhighWire(payload);
+	assertEq(payload.config.thinkingConfig.thinkingLevel, "XHIGH", "rewrite is idempotent");
+	const budgetPayload = { config: { thinkingConfig: { thinkingBudget: 1234 } } };
+	restoreXhighWire(budgetPayload);
+	assertEq((budgetPayload.config.thinkingConfig as Record<string, unknown>).thinkingLevel, undefined, "budget configs untouched");
+	assertEq(budgetPayload.config.thinkingConfig.thinkingBudget, 1234, "budget value untouched");
+	console.log("OK — xhigh virtual levels, v1alpha clone, and wire rewrite all pass");
+} else if (process.env.GEMINI_ROUTER_SMOKE === "model-first") {
   // Config case: order model-first, ladder [3.5-flash, 3.8-flash] (from the
   // seeded config). The ladder advances before the key.
   let r = route(flash, { reason: "user", thinkingLevel: "off", state: undefined });
